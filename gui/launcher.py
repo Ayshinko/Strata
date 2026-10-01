@@ -14,13 +14,10 @@ from __future__ import annotations
 
 import json
 import os
-import signal
-import subprocess
 import sys
 import time
 from pathlib import Path
 
-from gui import platforms
 from gui.platforms import get_launcher
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -33,7 +30,8 @@ SHUTDOWN_GRACE_S = 15.0
 
 class ServerState:
     """The Manager's runtime state file (<strata>/logs/manager.json, gitignored): which server process it
-    launched and which setup.py helper (custom GGUF) it is running."""
+    launched, the shutdown/restart lifecycle and the last stop's measurements, and which setup.py helper
+    (custom GGUF) it is running."""
 
     def __init__(self, root: Path = ROOT):
         self.path = root / STATE_DIR_NAME / STATE_FILE
@@ -43,13 +41,27 @@ class ServerState:
             st = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             st = {}
-        return {k: st.get(k) for k in ("server", "tool")}
+        return {k: st.get(k) for k in ("server", "tool", "lifecycle", "last_stop")}
 
     def write(self, st: dict) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(st, indent=1), encoding="utf-8")
         os.replace(tmp, self.path)
+
+
+def set_lifecycle(root: Path, state: str, phase: str) -> None:
+    """Record a shutdown/restart lifecycle in the runtime state so /api/status can report it (the UI shows
+    Stopping/Restarting + the current phase instead of looking frozen)."""
+    st = ServerState(root).read()
+    st["lifecycle"] = {"state": state, "phase": phase, "since": time.time()}
+    ServerState(root).write(st)
+
+
+def clear_lifecycle(root: Path) -> None:
+    st = ServerState(root).read()
+    st.pop("lifecycle", None)
+    ServerState(root).write(st)
 
 
 def read_config(path: Path) -> dict:
@@ -96,23 +108,40 @@ def pid_alive(pid: int) -> bool:
 
 
 def server_status(root: Path = ROOT) -> dict:
-    """stopped | starting | running.  The port is the ground truth (Strata answers it once the model is
-    loaded); the remembered PID distinguishes "starting" from "stopped"."""
+    """Lifecycle-aware status:
+      stopped | starting | running | stopping | restarting | error.
+    A shutdown/restart in progress (recorded by stop_server / restart_server) reports its own state and the
+    current phase (graceful | forcing | starting | running) with the elapsed seconds, so the UI can show
+    "Stopping… 4.2s" instead of guessing.  Otherwise the port is the ground truth (Strata answers it once the
+    model is loaded); the remembered PID distinguishes "starting" from "stopped"; a server the Manager
+    started that is gone without a clean stop is an "error" (it crashed)."""
     st = ServerState(root).read()
     srv = st.get("server") or {}
+    lc = st.get("lifecycle") or {}
     pid, port, name = srv.get("pid"), srv.get("port"), srv.get("config")
     if name:
         try:
             port = port or read_config(root / name).get("port", 8080)
         except (OSError, ValueError):
             pass
+    now = time.time()
+    if lc.get("state") in ("stopping", "restarting"):
+        since = float(lc.get("since") or now)
+        return {"state": lc["state"], "phase": lc.get("phase", "graceful"),
+                "since": since, "elapsed": round(max(0.0, now - since), 1),
+                "config": name, "port": port, "log": srv.get("log")}
     if port and probe_port("127.0.0.1", port):
         return {"state": "running", "port": port, "pid": pid, "config": name,
                 "ready": strata_ready(port), "log": srv.get("log")}
     if pid_alive(pid):
         return {"state": "starting", "port": port, "pid": pid, "config": name, "ready": False,
                 "log": srv.get("log")}
-    return {"state": "stopped", "port": port, "config": name, "ready": False}
+    if srv.get("pid"):                                   # started then died on its own (crash, import error...)
+        return {"state": "error", "port": port, "config": name, "ready": False,
+                "log": srv.get("log"),
+                "error": "the server exited before answering (see its log)"}
+    return {"state": "stopped", "port": port, "config": name, "ready": False,
+            "last_stop": st.get("last_stop")}
 
 
 def start_server(name: str, port: int | None, root: Path = ROOT, open_chat: bool = False) -> dict:
@@ -157,7 +186,8 @@ def start_server(name: str, port: int | None, root: Path = ROOT, open_chat: bool
 
 def stop_server(root: Path = ROOT) -> dict:
     """Stop the server the Manager started, through the platform adapter (Windows: close the process tree
-    like closing Strata's console; Linux: graceful SIGTERM to the server's group, force after grace)."""
+    like closing Strata's console; Linux: graceful SIGTERM to the server's group, force after grace).
+    Reports the measured shutdown time and whether the force path was needed."""
     st = ServerState(root).read()
     srv = st.get("server") or {}
     pid = srv.get("pid")
@@ -171,21 +201,65 @@ def stop_server(root: Path = ROOT) -> dict:
             if probe_port("127.0.0.1", port):
                 return {"ok": True, "state": "running", "note": "Strata is running from another window; close "
                         "that window to stop it (the Manager only stops what it started)."}
-        return {"ok": True, "state": "stopped", "note": "not running"}
-    get_launcher().terminate(int(pid), SHUTDOWN_GRACE_S)
-    st2 = ServerState(root).read()
-    st2.pop("server", None)
-    ServerState(root).write(st2)
-    return {"ok": True, "state": "stopped"}
+        return {"ok": True, "state": "stopped", "note": "not running", "elapsed_s": 0.0, "forced": False}
+    set_lifecycle(root, "stopping", "graceful")
+    t0 = time.time()
+    res = get_launcher().terminate(int(pid), SHUTDOWN_GRACE_S)
+    elapsed = round(time.time() - t0, 2)
+    _finish_stop(root, elapsed=elapsed, forced=bool(res.get("forced")))
+    return {"ok": True, "state": "stopped", "elapsed_s": elapsed, "forced": bool(res.get("forced"))}
+
+
+def force_stop_server(root: Path = ROOT) -> dict:
+    """Force Stop: the hard process-tree termination immediately (the platform's terminate_force), skipping
+    the graceful phase.  Only what the Manager started is touched."""
+    st = ServerState(root).read()
+    pid = (st.get("server") or {}).get("pid")
+    if not pid:
+        return {"ok": True, "state": "stopped", "note": "not running", "elapsed_s": 0.0, "forced": True}
+    set_lifecycle(root, "stopping", "forcing")
+    t0 = time.time()
+    res = get_launcher().terminate_force(int(pid))
+    elapsed = round(time.time() - t0, 2)
+    _finish_stop(root, elapsed=elapsed, forced=True, stopped=bool(res.get("stopped")))
+    return {"ok": True, "state": "stopped", "elapsed_s": elapsed, "forced": True,
+            "stopped": bool(res.get("stopped"))}
+
+
+def _finish_stop(root: Path, elapsed=None, forced=None, stopped=None) -> None:
+    """After a server is gone: drop the server record and the lifecycle, remember the stop measurements."""
+    st = ServerState(root).read()
+    last = st.get("last_stop") or {}
+    last.update({"elapsed_s": elapsed, "forced": forced, "stopped": stopped, "at": time.strftime("%H:%M:%S")})
+    st.pop("server", None)
+    st.pop("lifecycle", None)
+    st["last_stop"] = last
+    ServerState(root).write(st)
 
 
 def restart_server(name: str, port: int | None, root: Path = ROOT, open_chat: bool = False) -> dict:
-    stop_server(root)
-    for _ in range(20):                                  # let the port free up
-        if not probe_port("127.0.0.1", port or 8080):
-            break
-        time.sleep(0.5)
-    return start_server(name, port, root, open_chat=open_chat)
+    """Restart = Stop then Start, with the lifecycle going Restarting(stopping) → Restarting(starting) →
+    Starting → Running so the UI shows the whole thing instead of a frozen state."""
+    set_lifecycle(root, "restarting", "stopping")
+    t0 = time.time()
+    _stop_internal(root)
+    set_lifecycle(root, "restarting", "starting")
+    started = start_server(name, port, root, open_chat=open_chat)
+    if not started.get("ok"):
+        clear_lifecycle(root)
+        return {**started, "elapsed_s": round(time.time() - t0, 2), "forced": False}
+    clear_lifecycle(root)                                 # the next status poll sees starting → running
+    return {"ok": True, "state": "restarting", "elapsed_s": round(time.time() - t0, 2), "forced": False}
+
+
+def _stop_internal(root: Path) -> None:
+    """The stop half of a restart: same termination, without touching the restart lifecycle."""
+    st = ServerState(root).read()
+    pid = (st.get("server") or {}).get("pid")
+    if not pid:
+        return
+    get_launcher().terminate(int(pid), SHUTDOWN_GRACE_S)
+    _finish_stop(root)
 
 
 def run_tool(cmd: list, log_path: Path, what: str, root: Path = ROOT) -> dict:

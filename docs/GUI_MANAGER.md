@@ -47,6 +47,11 @@ writes.  Starting Strata runs the **same `serve/server.py` + config command** th
   (`serve/server.py --engine strata --config … --port …`), remembers its PID in `logs/manager.json`, and
   checks the port so it can never launch a second instance (Strata's server itself also refuses a busy
   port).  **Stop** closes the server's process tree — the same outcome as closing Strata's console window.
+  The UI never looks frozen: Stop/Restart switch to a visible Stopping/Restarting indicator with the real
+  phase ("Gracefully shutting down the engine", measured "… 4.2s") from the backend's lifecycle state, and
+  confirm with "Stopped in Xs".  Graceful shutdown is always tried first; **Force Stop** terminates the
+  process tree immediately (separate button, shown during a stop), because graceful shutdown on Windows has
+  no real external signal — the engine's own QUIT path still gets its grace time.
 - **System** — GPU names, VRAM total/used and RAM total/used (measured, from `nvidia-smi` / the OS;
   nothing is estimated or invented).
 
@@ -84,7 +89,7 @@ The Manager is one codebase for Windows and Linux - the web UI and all config/lo
 
   | platform | spawn | stop |
   |----------|-------|------|
-  | `windows.py` | `DETACHED_PROCESS` + new process group (no console) | close the process tree (`taskkill /T`, force `/T /F` after a grace) - Strata's "close the window" outcome |
+  | `windows.py` | `CREATE_NEW_CONSOLE` with a console window **hidden from birth** (`STARTUPINFO` SW_HIDE) — the engine inherits it instead of popping a new blank console terminal of its own (a console child of a console-less parent gets a visible window; this is what the "extra blank terminal" was) | graceful attempt first (~3 s), then close the process tree (`taskkill /T /F`) — Strata's "close the window" outcome; **Force Stop** skips straight to `taskkill /T /F` |
   | `linux.py` | new session (`start_new_session=True`) | `SIGTERM` to the server's process group (serve/server.py handles it gracefully - QUIT to the engine), `SIGKILL` after a grace |
 
 - **Startup convenience** (both just run the same `gui/manager.py`): `START-MANAGER.bat` (Windows) and
@@ -114,9 +119,12 @@ All of these are gitignored machine data.
 ## Platform notes
 
 - Run `START-HERE.bat` / `setup.sh` once first if `.venv` is missing.
-- **Stop** ends the whole Strata process tree - on Windows `taskkill /T` (Strata's "close the console
-  window" outcome: server, engine, vision encoder and MCP children together), on Linux a graceful SIGTERM to
-  the server's process group (`serve/server.py` QUITs the engine) with a SIGKILL fallback.
+- **Stop** ends the whole Strata process tree — on Windows a graceful attempt first (~3 s; the fast
+  `taskkill /T /F` follows, so a normal Stop takes about 3 s) and on Linux a graceful SIGTERM to the
+  server's process group (`serve/server.py` QUITs the engine) with a SIGKILL fallback.  If a stop is taking
+  too long, **Force Stop** terminates the tree immediately.
+- On Windows the launched server runs in a **hidden** console, so no extra blank terminal flashes next to
+  the browser while the engine/server run (their output still lives in the log files the Manager tails).
 - If Strata is running from its own console window (`START-HERE.bat` / `./setup.sh`), the Manager shows it
   as **running** but its **Stop** button only controls what the Manager itself started — close the other
   window instead.

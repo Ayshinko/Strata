@@ -16,9 +16,11 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.request
 from pathlib import Path
@@ -337,10 +339,12 @@ class LauncherTest(unittest.TestCase):
 
     class FakeLauncher:
         name = "fake"
+        force_result = {"stopped": True, "forced": True}
 
         def __init__(self):
             self.spawned = []
             self.terminated = []
+            self.force_terminated = []
 
         def spawn(self, cmd, cwd, log_file):
             self.spawned.append((cmd, cwd, log_file))
@@ -348,7 +352,11 @@ class LauncherTest(unittest.TestCase):
 
         def terminate(self, pid, grace_s):
             self.terminated.append(pid)
-            return True
+            return {"stopped": True, "forced": False}
+
+        def terminate_force(self, pid):
+            self.force_terminated.append(pid)
+            return self.force_result
 
         @staticmethod
         def alive(pid):
@@ -408,12 +416,58 @@ class LauncherTest(unittest.TestCase):
         r = mgr.stop_server(self.root)
         self.assertEqual(r["state"], "stopped")
         self.assertEqual(self.fake.terminated, [9999])
-        self.assertEqual(mgr.launcher.ServerState(self.root).read()["server"], None)
+        st = mgr.launcher.ServerState(self.root).read()
+        self.assertEqual(st["server"], None)
+        self.assertEqual(st["lifecycle"], None)
+        self.assertEqual(st["last_stop"]["elapsed_s"] >= 0.0, True)   # measured, not faked
+        self.assertEqual(st["last_stop"]["forced"], False)
+
+    def test_force_stop_uses_the_hard_path_only(self):
+        self._write_state(pid=7777, config="strata-x.json", port=18080, log="no.log")
+        r = mgr.force_stop_server(self.root)
+        self.assertEqual(r["state"], "stopped")
+        self.assertEqual(r["forced"], True)
+        self.assertEqual(self.fake.force_terminated, [7777])
+        self.assertEqual(self.fake.terminated, [])                    # graceful terminate never ran
+        self.assertIsNone(mgr.launcher.ServerState(self.root).read()["server"])
+
+    def test_lifecycle_shows_stopping_and_restarting(self):
+        self._write_state(pid=9999, config="strata-x.json", port=18080, log="no.log")
+        mgr.launcher.set_lifecycle(self.root, "stopping", "graceful")
+        time.sleep(0.05)
+        s = mgr.launcher.server_status(self.root)
+        self.assertEqual(s["state"], "stopping")
+        self.assertEqual(s["phase"], "graceful")
+        self.assertGreater(s["elapsed"], 0.0)
+        mgr.launcher.set_lifecycle(self.root, "restarting", "starting")
+        self.assertEqual(mgr.launcher.server_status(self.root)["state"], "restarting")
 
     def test_stop_without_a_managed_server_is_a_noop(self):
         r = mgr.stop_server(self.root)
         self.assertEqual(r["state"], "stopped")
         self.assertEqual(self.fake.terminated, [])
+
+    def test_windows_spawn_uses_a_hidden_console(self):
+        if os.name != "nt":
+            self.skipTest("Windows-launcher behavior checked on Windows")
+        from gui.platforms.windows import WindowsLauncher
+        calls = {}
+
+        def fake_popen(*a, **kw):
+            calls.update(kw)
+            return type("P", (), {"pid": 1234})()
+
+        fd, path = tempfile.mkstemp()
+        os.close(fd)
+        log = Path(path)
+        self.addCleanup(lambda: log.unlink(missing_ok=True))
+        with mock.patch("gui.platforms.windows.subprocess.Popen", fake_popen):
+            pid = WindowsLauncher().spawn(["python", "-m", "x"], str(Path(".").resolve()), log)
+        self.assertEqual(pid, 1234)
+        flags = calls["creationflags"]
+        self.assertTrue(flags & subprocess.CREATE_NEW_CONSOLE)     # a real console to inherit
+        self.assertFalse(flags & subprocess.DETACHED_PROCESS)      # ...not console-less
+        self.assertEqual(calls["startupinfo"].wShowWindow, 0)      # SW_HIDE: born invisible
 
     def test_linux_adapter_module_imports_everywhere(self):
         from gui.platforms.linux import LinuxLauncher   # importable on any OS (calls are OS-conditional)

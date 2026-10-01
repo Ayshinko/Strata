@@ -5,7 +5,9 @@ const $ = (id) => document.getElementById(id);
 const POLL_MS = 4000;
 
 const state = { models: [], editor: null, status: { server: { state: "unknown" } }, tool: null,
-                busy: false, lastStart: 0 };
+                busy: false, ggufDetect: null };
+// the running operation (Stop / Force Stop / Restart): shown immediately on click, updated by polling.
+const op = { state: null, phase: null, since: 0, lastDone: null, ticker: null };
 
 /* ---------------------------------------------------------------- API */
 async function api(path, opts) {
@@ -30,7 +32,7 @@ function toast(msg, kind) {
   t.dataset.kind = kind || "";
   t.hidden = false;
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => { t.hidden = true; }, kind === "error" ? 7000 : 3500);
+  toastTimer = setTimeout(() => { t.hidden = true; }, kind === "error" ? 7000 : 5000);
 }
 
 /* ---------------------------------------------------------------- system + state pill */
@@ -45,30 +47,92 @@ async function refreshSystem() {
 }
 
 const PILL_TEXT = { "running": "running", "starting": "starting…", "stopped": "stopped",
-                    "unknown": "…", "error": "error" };
+                    "stopping": "stopping…", "restarting": "restarting…",
+                    "error": "error", "unknown": "…" };
 function setPill(status, note) {
   const p = $("state-pill");
   p.dataset.state = status.state || "unknown";
   p.textContent = (PILL_TEXT[status.state] || status.state) + (note ? ` — ${note}` : "");
 }
 
+/* ---------------------------------------------------------------- operation display */
+const OP_PHASE = {
+  stopping:  { stopping: "Stopping Strata…", graceful: "Gracefully shutting down the engine", forcing: "Force-stopping…" },
+  restarting: { stopping: "Restarting… (stopping)", starting: "Restarting… (starting)", running: "Restarting… (running)" },
+};
+const OP_TITLE = { stopping: "Stopping Strata", restarting: "Restarting Strata" };
+
+function setOp(stateName, phase, elapsed) {
+  if (op.state !== stateName || op.phase !== phase) {
+    op.state = stateName;
+    op.phase = phase;
+    op.since = Date.now() - (elapsed != null ? elapsed * 1000 : 0);
+  } else if (elapsed != null) {
+    op.since = Date.now() - elapsed * 1000;              // keep in step with the backend's clock
+  }
+  $("op").hidden = false;
+  if (op.ticker == null) {
+    op.ticker = setInterval(opTick, 250);
+  }
+  opTick();
+}
+
+function opTick() {
+  const table = OP_PHASE[op.state] || {};
+  const base = table[op.phase] || OP_TITLE[op.state] || "Working…";
+  const s = Math.max(0, (Date.now() - op.since) / 1000);
+  $("op-text").textContent = `${base}  ${s.toFixed(1)}s`;
+}
+
+function clearOp() {
+  op.state = null;
+  op.phase = null;
+  $("op").hidden = true;
+  if (op.ticker != null) { clearInterval(op.ticker); op.ticker = null; }
+}
+
+function fmtElapsed(secs) {
+  return secs != null ? `${secs.toFixed(1)}s` : "";
+}
+
+/* ---------------------------------------------------------------- status + buttons */
 function refreshButtons() {
   const s = state.status.server;
-  const on = s.state === "running" || s.state === "starting";
-  $("start").disabled = state.busy || on || !state.models.length;
-  $("stop").disabled = state.busy || !on || s.state === "stopped";
-  $("restart").disabled = state.busy || !on;
+  const st = s.state;
+  const inOp = (st === "stopping" || st === "restarting");
+  $("start").disabled = state.busy || inOp || st === "running" || st === "starting" || !state.models.length;
+  $("stop").disabled = state.busy || inOp || (st !== "running" && st !== "starting");
+  $("restart").disabled = state.busy || inOp || st !== "running";
+  $("force-stop").hidden = !inOp;
   $("save").disabled = state.busy || !state.editor;
 }
 
 async function refreshStatus() {
   try {
     const st = await api("/api/status");
+    const prev = state.status.server ? state.status.server.state : "unknown";
     state.status = st;
     state.tool = st.tool;
-    setPill(st.server,
-      st.server.state === "running" ? `port ${st.server.port}` :
-      st.server.state === "starting" ? "model loading…" : "");
+
+    const srv = st.server;
+    if (srv.state === "stopping" || srv.state === "restarting") {
+      setOp(srv.state, srv.phase, srv.elapsed);
+      setPill(srv, srv.phase === "forcing" ? "force-stopping" : srv.phase);
+    } else {
+      if (op.state === "restarting" && srv.state === "running") {
+        const secs = Math.max(0, (Date.now() - op.since) / 1000);
+        clearOp();
+        toast(`Restarted in ${secs.toFixed(1)}s — the model is serving again (port ${srv.port})`, "ok");
+      } else if (op.state === "restarting" || op.state === "stopping") {
+        clearOp();                                        // stopped (or crashed) - the response already said why
+      }
+      if (srv.state === "error") {
+        setPill(srv, (srv.error || "exited unexpectedly") + " — see Server log");
+      } else {
+        setPill(srv, srv.state === "running" ? `port ${srv.port}` : "");
+      }
+      if (prev === "resumed") { /* ignore */ }
+    }
     refreshButtons();
     handleLog();
     handleTool();
@@ -83,8 +147,7 @@ function renderModels(defaultName) {
   ul.textContent = "";
   const tpl = $("tpl-model");
   for (const m of state.models) {
-    const li = tpl.content.firstElementChild ? tpl.content.firstElementChild.cloneNode(true)
-                                             : document.createElement("li");
+    const li = tpl.content.firstElementChild.cloneNode(true);
     li.className = "model";
     li.querySelector(".model__title").textContent = m.title;
     li.querySelector(".badge.quant").textContent = m.quant || m.family || "?";
@@ -108,7 +171,9 @@ function renderModels(defaultName) {
     const gg = li.querySelector(".model__gguf");
     gg.textContent = m.gguf && m.gguf[0] ? m.gguf[0] : (m.pack ? "pack: " + m.pack : "");
     li.querySelector("button.select").addEventListener("click", () => selectModel(m.config));
-    li.querySelector("button.edit").addEventListener("click", () => { selectModel(m.config); window.scrollTo({ top: 0, behavior: "smooth" }); });
+    li.querySelector("button.edit").addEventListener("click", () => {
+      selectModel(m.config); window.scrollTo({ top: 0, behavior: "smooth" });
+    });
     ul.appendChild(li);
   }
   ul.hidden = !state.models.length;
@@ -116,7 +181,7 @@ function renderModels(defaultName) {
     const li = document.createElement("li");
     li.className = "model";
     li.innerHTML = `<div class="model__title">None yet</div>
-      <div class="model__meta">Install a model with SETUP.bat / START-HERE.bat first — the Manager manages, it does not install.</div>`;
+      <div class="model__meta">Install a model with SETUP.bat / setup.sh first — the Manager manages, it does not install.</div>`;
     ul.appendChild(li);
     ul.hidden = false;
   }
@@ -140,7 +205,6 @@ function fillEditor() {
   $("ctx-num").value = e.context || 32768;
   renderChips(e);
   updateCtxHint();
-  for (const r of document.querySelectorAll('input[name="vision"]')) r.disabled = false;
   const vis = e.vision || "off";
   for (const r of document.querySelectorAll('input[name="vision"]')) r.checked = r.value === vis;
   $("lowram").checked = e.low_ram;
@@ -265,30 +329,71 @@ async function doSave() {
 }
 
 /* ---------------------------------------------------------------- start / stop / restart */
-async function doStart() { await doControl("start"); }
-async function doStop()   { await doControl("stop"); }
-async function doRestart(){ await doControl("restart"); }
-
-async function doControl(kind) {
+async function doStart() {
   if (!state.editor) return;
   state.busy = true; refreshButtons();
   try {
-    const body = { config: state.editor.summary.config, port: parseInt($("port-num").value, 10) || undefined, open_chat: false };
-    const r = kind === "stop" ? await post("/api/stop") : await post("/api/" + kind, body);
-    if (r.error) { toast(r.error, "error"); return; }
-    toast(kind === "start" ? "starting Strata — the model loads in the background" :
-          kind === "stop" ? "stopped Strata" : "restarting Strata", "ok");
+    const r = await post("/api/start", { config: state.editor.summary.config,
+                                         port: parseInt($("port-num").value, 10) || undefined,
+                                         open_chat: false });
+    if (r.error) { toast(r.error, "error"); }
+    else toast("starting Strata — the model loads in the background", "ok");
     await refreshStatus();
-    if (kind === "stop") setTimeout(refreshStatus, 1200);
   } catch (err) { toast(err.message, "error"); }
   state.busy = false; refreshButtons();
+}
+
+async function doStop() {
+  if (!state.editor) return;
+  setOp("stopping", "graceful");                       // react instantly: don't wait for the API call
+  refreshButtons();
+  try {
+    const r = await post("/api/stop");
+    const t = r.elapsed_s != null ? `Stopped in ${fmtElapsed(r.elapsed_s)}` : "Stopped";
+    toast(r.forced ? `${t} — the graceful shutdown timed out, so the process tree was force-closed`
+                   : `${t} — graceful shutdown`, "ok");
+  } catch (err) { toast(err.message, "error"); }
+  clearOp();                                           // the next status poll confirms "stopped"
+  await refreshStatus();
+}
+
+async function doForceStop() {
+  if (!state.editor) return;
+  setOp("stopping", "forcing");
+  refreshButtons();
+  try {
+    const r = await post("/api/force-stop");
+    toast(`Force-stopped in ${fmtElapsed(r.elapsed_s)} — the process tree was terminated immediately`, "ok");
+  } catch (err) { toast(err.message, "error"); }
+  clearOp();
+  await refreshStatus();
+}
+
+async function doRestart() {
+  if (!state.editor) return;
+  setOp("restarting", "stopping");
+  refreshButtons();
+  try {
+    const r = await post("/api/restart", {
+      config: state.editor.summary.config,
+      port: parseInt($("port-num").value, 10) || undefined,
+      open_chat: false,
+    });
+    if (r.error) { toast(r.error, "error"); clearOp(); }
+    // otherwise: the operation indicator stays up; polls walk it through stopping → starting → running,
+    // and refreshStatus() shows "Restarted — the model is serving again" when it reaches running.
+  } catch (err) { toast(err.message, "error"); clearOp(); }
+  refreshButtons();
 }
 
 /* ---------------------------------------------------------------- log + tool */
 let logRefreshAt = 0;
 async function handleLog() {
   const s = state.status.server;
-  if ((s.state !== "starting" && s.state !== "running") || !s.log) { $("logcard").hidden = true; return; }
+  if (!s.log) return;
+  const showState0 = s.state === "starting" || s.state === "running" || s.state === "error";
+  const showState = op.state != null || showState0;     // mid-operation: leave the last log visible
+  if (!showState) { $("logcard").hidden = true; return; }
   const now = Date.now();
   if (now < logRefreshAt) return;
   logRefreshAt = now + 3000;
@@ -417,6 +522,7 @@ $("ctx-num").addEventListener("input", () => { syncChips(); updateCtxHint(); });
 $("save").addEventListener("click", doSave);
 $("start").addEventListener("click", doStart);
 $("stop").addEventListener("click", doStop);
+$("force-stop").addEventListener("click", doForceStop);
 $("restart").addEventListener("click", doRestart);
 $("gguf-browse").addEventListener("click", () => openBrowse($("gguf-path").value || ""));
 $("browse-close").addEventListener("click", () => { $("browse-modal").hidden = true; });

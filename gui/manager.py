@@ -57,7 +57,8 @@ PRESET_CONTEXTS = sorted(set([8192, 16384, 32768, 65536, 131072, 262144]) | set(
 # the supervisor (Start/Stop/Restart, the runtime state, the server's log) lives in gui/launcher.py and is
 # platform-neutral there - the OS-specific half is gui/platforms/
 from gui import launcher                                     # noqa: E402
-from gui.launcher import server_status, start_server, stop_server, restart_server, run_tool, tail_lines  # noqa: E402
+from gui.launcher import (server_status, start_server, stop_server, force_stop_server,  # noqa: E402
+                          restart_server, run_tool, tail_lines)
 
 
 # ====================================================================================================== small helpers
@@ -548,6 +549,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(m.start(body))
             elif u.path == "/api/stop":
                 self._json(stop_server(m.root))
+            elif u.path == "/api/force-stop":
+                self._json(force_stop_server(m.root))
             elif u.path == "/api/restart":
                 self._json(m.restart(body))
             elif u.path == "/api/browse":

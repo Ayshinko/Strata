@@ -3,7 +3,7 @@
 Spawn: a new session (start_new_session=True) - the server becomes a process-group leader, and everything it
 starts (the engine, the vision encoder, the MCP servers: plain children) stays in that group.  Stop: SIGTERM
 to the group first - serve/server.py's own signal handler turns it into a graceful shutdown (it sends QUIT to
-the engine) - then SIGKILL to the group after the grace.
+the engine) - then SIGKILL to the group after the grace.  Force Stop: SIGKILL immediately.
 """
 
 from __future__ import annotations
@@ -28,24 +28,36 @@ class LinuxLauncher(Launcher):
             f.close()
         return proc.pid
 
-    def terminate(self, pid: int, grace_s: float) -> bool:
+    def terminate(self, pid: int, grace_s: float) -> dict:
         try:
             os.killpg(int(pid), signal.SIGTERM)              # graceful: server.py QUITs the engine
         except OSError:
             pass
-        for _ in range(max(1, int(grace_s * 2))):
-            if not self.alive(pid):
-                return True
-            time.sleep(0.5)
+        if self._wait_dead(pid, grace_s):
+            return {"stopped": True, "forced": False}
         try:
             os.killpg(int(pid), signal.SIGKILL)
         except OSError:
             pass
-        for _ in range(int(grace_s)):
-            if not self.alive(pid):
+        self._wait_dead(pid, grace_s)
+        return {"stopped": not self.alive(pid), "forced": True}
+
+    def terminate_force(self, pid: int) -> dict:
+        try:
+            os.killpg(int(pid), signal.SIGKILL)
+        except OSError:
+            pass
+        self._wait_dead(pid, 5.0)
+        return {"stopped": not self.alive(pid), "forced": True}
+
+    @staticmethod
+    def _wait_dead(pid: int, seconds: float) -> bool:
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            if not LinuxLauncher.alive(pid):
                 return True
-            time.sleep(0.5)
-        return not self.alive(pid)
+            time.sleep(0.25)
+        return not LinuxLauncher.alive(pid)
 
     @staticmethod
     def alive(pid: int) -> bool:

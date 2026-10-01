@@ -1,18 +1,34 @@
 """Windows process handling for the Manager's launcher.
 
-Spawn: a detached process (no console window) in its own process group.  Stop: close the whole process tree
-with taskkill /T - the documented Strata outcome ("closing the console window stops the model": server,
-engine, vision encoder and MCP children end together).  taskkill without /F posts a WM_CLOSE a windowless
-detached server cannot answer, so after a short grace the tree is force-closed.
+Spawn: a NEW CONSOLE process whose console window is hidden from birth (STARTUPINFO SW_HIDE).  The reason:
+on Windows a console-subsystem child (the engine, strata.exe) spawned by a process with NO console gets a
+brand-new VISIBLE console window - an extra blank terminal in front of the browser.  Giving the server a
+hidden console to inherit removes the window entirely while keeping Strata's server/engine console-less from
+the user's point of view (all their output still goes to the log files the Manager tails).
+
+Stop: close the whole process tree with taskkill /T - Strata's documented "close the console window"
+outcome (server, engine, vision encoder and MCP children end together).  taskkill without /F posts a WM_CLOSE
+a windowless detached server cannot answer, so after a short grace the tree is force-closed (and the stop
+result says so - the UI then shows it took the forced path).
+
+No PowerShell, no .bat: only CreateProcess + taskkill.
 """
 
 from __future__ import annotations
 
-import os
 import subprocess
 import time
 
 from .base import Launcher
+
+# Born hidden: the console exists (so console children inherit it) but no window ever shows.
+_HIDDEN_CONSOLE = subprocess.STARTUPINFO()
+_HIDDEN_CONSOLE.dwFlags = subprocess.STARTF_USESHOWWINDOW
+_HIDDEN_CONSOLE.wShowWindow = 0                       # SW_HIDE
+
+# Windows' soft taskkill (no /F) only posts a WM_CLOSE a windowless detached server cannot answer: treat it
+# as the graceful attempt, cap the wait so a normal Stop stays snappy (<4 s), then force-close the tree.
+_SOFT_GRACE_S = 3.0
 
 
 class WindowsLauncher(Launcher):
@@ -22,29 +38,56 @@ class WindowsLauncher(Launcher):
         with open(log_file, "a", encoding="utf-8") as f:
             p = subprocess.Popen(
                 cmd, cwd=cwd, stdout=f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
-                close_fds=False)
+                creationflags=subprocess.CREATE_NEW_CONSOLE | subprocess.CREATE_NEW_PROCESS_GROUP,
+                startupinfo=_HIDDEN_CONSOLE, close_fds=False)
         return p.pid
 
-    def terminate(self, pid: int, grace_s: float) -> bool:
-        subprocess.run(["taskkill", "/PID", str(pid), "/T"], capture_output=True, timeout=grace_s + 1)
-        for _ in range(max(1, int(grace_s * 2))):
-            if not self.alive(pid):
+    def terminate(self, pid: int, grace_s: float) -> dict:
+        subprocess.run(["taskkill", "/PID", str(pid), "/T"], capture_output=True,
+                       timeout=max(1, int(grace_s) + 1))
+        if self._wait_dead(pid, min(grace_s, _SOFT_GRACE_S)):
+            return {"stopped": True, "forced": False}
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True,
+                       timeout=max(1, int(grace_s) + 1))
+        self._wait_dead(pid, 8.0)
+        return {"stopped": not self.alive(pid), "forced": True}
+
+    def terminate_force(self, pid: int) -> dict:
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, timeout=30)
+        self._wait_dead(pid, 8.0)
+        return {"stopped": not self.alive(pid), "forced": True}
+
+    @staticmethod
+    def _wait_dead(pid: int, seconds: float) -> bool:
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            if not WindowsLauncher.alive(pid):
                 return True
-            time.sleep(0.5)
-        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, timeout=grace_s + 1)
-        for _ in range(int(grace_s)):
-            if not self.alive(pid):
-                return True
-            time.sleep(0.5)
-        return not self.alive(pid)
+            time.sleep(0.25)
+        return not WindowsLauncher.alive(pid)
 
     @staticmethod
     def alive(pid: int) -> bool:
+        """A reliable Windows existence check.  os.kill(pid, 0) is not one: it keeps reporting a
+        process as alive for a while after TerminateProcess.  OpenProcess + GetExitCodeProcess
+        (STILL_ACTIVE) answers immediately and handles Access Denied correctly."""
         if not pid:
             return False
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        k32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        # PROCESS_QUERY_LIMITED_INFORMATION: enough for GetExitCodeProcess, works for any user's processes
+        h = k32.OpenProcess(0x1000, False, int(pid))
+        if not h:
+            return False                                # gone (or not accessible): not alive
         try:
-            os.kill(int(pid), 0)
-            return True
-        except OSError:
-            return False
+            code = wintypes.DWORD()
+            if not k32.GetExitCodeProcess(h, ctypes.byref(code)):
+                return False
+            return code.value == 259                    # STILL_ACTIVE
+        finally:
+            k32.CloseHandle(h)

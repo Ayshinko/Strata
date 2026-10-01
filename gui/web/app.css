@@ -131,9 +131,29 @@ select.ctl { padding-right: var(--st-s-4); }
 .btn--accent { background: var(--st-accent-tint); color: var(--st-accent-text);
                border-color: transparent; }
 .btn--accent:hover { background: rgba(52, 211, 153, .22); color: var(--st-accent-hover); }
+.btn--danger { background: var(--st-danger-tint); color: var(--st-danger-text);
+               border-color: transparent; }
+.btn--danger:hover { background: rgba(255, 90, 110, .22); }
 .btn--big { padding: 10px 22px; font-size: var(--st-fs-md); font-weight: var(--st-fw-bold); }
 .btn--s { padding: 3px 12px; font-size: var(--st-fs-xs); }
-.actions { display: flex; gap: var(--st-s-3); margin-top: var(--st-s-5); flex-wrap: wrap; }
+.actions { display: flex; gap: var(--st-s-3); margin-top: var(--st-s-5); flex-wrap: wrap;
+           align-items: center; }
+
+/* ---------------------------------------------------------------- running operation */
+.op {
+  display: inline-flex; align-items: center; gap: var(--st-s-2);
+  color: var(--st-warn-text); font-size: var(--st-fs-sm); font-weight: var(--st-fw-medium);
+  padding: 8px 14px; border: 1px solid color-mix(in srgb, var(--st-warn) 45%, var(--st-line));
+  border-radius: var(--st-r-md); background: var(--st-warn-tint);
+  font-variant-numeric: tabular-nums;
+}
+.spinner {
+  width: 14px; height: 14px; flex: none;
+  border: 2px solid color-mix(in srgb, var(--st-warn) 35%, transparent);
+  border-top-color: var(--st-warn); border-radius: 50%;
+  animation: spin .8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
 
 /* ---------------------------------------------------------------- models */
 .badge {
