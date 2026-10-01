@@ -1,0 +1,446 @@
+"""Tests for the Strata Manager's backend (gui/manager.py).
+
+The Manager only reuses Strata's own logic (setup.py) and its own config format, so the tests cover:
+  - reading existing configs (model_summary / discover, on temp copies - never the user's real ones)
+  - the surgical edits Save performs (context/rope/KV, Vision, Low-RAM, network, GPU)
+  - atomic saves with .bak backups, and that a saved config stays readable
+  - the custom-GGUF name detection (shards, family, size)
+  - a real HTTP round-trip against a temp Strata folder (GET /, /api/models, /api/save)
+
+Pure stdlib + unittest; no GPU, no network, no downloads.
+
+    python -m unittest gui.test_manager
+"""
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import sys
+import tempfile
+import threading
+import unittest
+import urllib.request
+from pathlib import Path
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+import setup                                          # noqa: E402
+import gui.manager as mgr                              # noqa: E402
+
+SHARD1 = "Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf"
+SHARD2 = "Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf"
+FAKE_GPU = {"index": 0, "name": "Fake GPU", "vram_gb": 12.0, "arch": "100",
+            "driver": "600", "count": 1}
+
+
+def sample_cfg(**over):
+    """A minimal but real-looking strata-q2_0 config (a temp copy - never a user file)."""
+    cfg = {
+        "exe": "C:/fake/strata.exe",
+        "args": ["--pack", "C:/fake/pack/q2_0", "--native", f"C:/fake/{SHARD1}",
+                 "--ple-gguf", f"C:/fake/{SHARD2}", "--expert-cache", "auto",
+                 "--max-context", "32768", "--kv", "int8"],
+        "cwd": "C:/fake",
+        "tokenizer": "C:/fake/pack/q2_0/tokenizer",
+        "model_name": "qwen3.8-flash-next-q2_0",
+        "log": "C:/fake/strata-q2_0.log",
+        "port": 8080,
+    }
+    cfg.update(over)
+    return cfg
+
+
+class ArgsHelpers(unittest.TestCase):
+    def test_set_arg_val_in_place(self):
+        a = ["--a", "1", "--b", "2"]
+        self.assertEqual(mgr.set_arg_val(a, "--b", "9"), ["--a", "1", "--b", "9"])
+        self.assertEqual(mgr.set_arg_val(a, "--c", "3"), ["--a", "1", "--b", "2", "--c", "3"])
+        self.assertEqual(mgr.arg_val(a, "--b"), "2")
+        self.assertIsNone(mgr.arg_val(a, "--nope"))
+
+    def test_drop_arg_pair_and_flag(self):
+        self.assertEqual(mgr.drop_arg(["--kv", "int8", "--spec", "4"], "--kv"), ["--spec", "4"])
+        self.assertEqual(mgr.drop_arg(["--vision", "--k", "1"], "--vision"), ["--k", "1"])
+        self.assertEqual(mgr.drop_arg(["--x", "--y", "2"], "--x"), ["--y", "2"])
+
+
+class ContextEdits(unittest.TestCase):
+    def test_sets_max_context_and_adds_int8_kv_above_8k(self):
+        a = mgr.apply_context(["--pack", "p"], 32768)
+        self.assertEqual(mgr.arg_val(a, "--max-context"), "32768")
+        self.assertEqual(mgr.arg_val(a, "--kv"), "int8")
+
+    def test_below_8k_drops_kv(self):
+        a = mgr.apply_context(["--kv", "q4_0", "--max-context", "65536"], 8192)
+        self.assertIsNone(mgr.arg_val(a, "--kv"))
+        self.assertEqual(mgr.arg_val(a, "--max-context"), "8192")
+
+    def test_past_trained_adds_yarn_with_derived_factor(self):
+        a = mgr.apply_context([], 393216)
+        self.assertEqual(mgr.arg_val(a, "--rope-scaling"), "yarn")
+        self.assertEqual(float(mgr.arg_val(a, "--rope-scale")), 1.5)   # 393216 / 262144
+        inside = mgr.apply_context(["--rope-scaling", "yarn", "--rope-scale", "1.5"], 131072)
+        self.assertEqual(mgr.arg_val(inside, "--rope-scaling"), "yarn")  # explicit choice is kept
+
+    def test_kv_resident_dropped_below_64k(self):
+        a = mgr.apply_context(["--kv-resident", "32768"], 32768)
+        self.assertIsNone(mgr.arg_val(a, "--kv-resident"))
+
+    def test_apply_kv_only_above_8k(self):
+        self.assertEqual(mgr.apply_kv([], 4096, "q4_0"), [])
+        self.assertIn("q4_0", mgr.apply_kv([], 16384, "q4_0"))
+
+
+class VisionEdits(unittest.TestCase):
+    def setUp(self):
+        self.cfg = sample_cfg(vision={"exe": "C:/fake/strata-vision.exe", "mmproj": "C:/fake/mmproj.gguf",
+                                      "model": f"C:/fake/{SHARD1}", "gpu": True, "max_tokens": 1024},
+                              args=["--vision", "--vram-reserve-mib", "700", "--max-context", "32768"])
+
+    def test_off_removes_section_and_flags(self):
+        out = mgr.apply_vision(ROOT, self.cfg, "off")
+        self.assertNotIn("vision", out)
+        self.assertNotIn("--vision", out["args"])
+        self.assertNotIn("--vram-reserve-mib", out["args"])
+        self.assertEqual(mgr.vision_mode(out), "off")
+
+    def test_gpu_cpu_switch_keeps_paths(self):
+        g = mgr.apply_vision(ROOT, self.cfg, "gpu")
+        self.assertTrue(g["vision"]["gpu"])
+        self.assertEqual(g["vision"]["max_tokens"], setup.VISION["gpu"]["max_tokens"])
+        c = mgr.apply_vision(ROOT, self.cfg, "cpu")
+        self.assertFalse(c["vision"]["gpu"])
+        self.assertEqual(c["vision"]["max_tokens"], setup.VISION["cpu"]["max_tokens"])
+        self.assertIn("--vision", c["args"])
+        self.assertIn("threads", c["vision"])
+
+    def test_reconstructs_section_from_disk(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "engine").mkdir()
+            (root / "engine" / "strata-vision.exe").write_bytes(b"")
+            shard = root / SHARD1
+            shard.write_bytes(b"")
+            (root / "mmproj-Qwen3.8-Flash-Next-BF16.gguf").write_bytes(b"")
+            cfg = sample_cfg(args=["--native", str(shard), "--max-context", "32768"])   # no vision section
+            out = mgr.apply_vision(root, cfg, "gpu")
+            v = out["vision"]
+            self.assertTrue(v["gpu"])
+            self.assertEqual(v["exe"], str(root / "engine" / "strata-vision.exe"))
+            self.assertEqual(v["mmproj"], str(root / "mmproj-Qwen3.8-Flash-Next-BF16.gguf"))
+            self.assertEqual(v["model"], str(shard))
+
+    def test_refuses_when_files_missing(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = sample_cfg(args=["--native", str(root / "nope.gguf"), "--max-context", "32768"])
+            with self.assertRaises(ValueError):
+                mgr.apply_vision(root, cfg, "gpu")
+
+
+class LowRamNetworkGpu(unittest.TestCase):
+    def test_low_ram_flag_round_trip(self):
+        cfg = sample_cfg(args=["--mmap-experts", "--max-context", "32768"])
+        self.assertEqual(mgr.low_ram_mode(cfg), "mmap")
+        off = mgr.apply_low_ram(cfg, False)
+        self.assertEqual(mgr.low_ram_mode(off), "off")
+        on = mgr.apply_low_ram(off, True, resident=True)
+        self.assertEqual(mgr.low_ram_mode(on), "resident")
+        on2 = mgr.apply_low_ram(off, True, resident=False)
+        self.assertEqual(mgr.low_ram_mode(on2), "mmap")
+
+    def test_network_fields(self):
+        cfg = sample_cfg()
+        out = mgr.apply_network(cfg, 9090, "0.0.0.0", "secret")
+        self.assertEqual(out["port"], 9090)
+        self.assertEqual(out["host"], "0.0.0.0")
+        self.assertEqual(out["api_key"], "secret")
+        back = mgr.apply_network(out, None, "127.0.0.1", "")
+        self.assertNotIn("host", back)
+        self.assertNotIn("api_key", back)
+
+    def test_gpu(self):
+        self.assertEqual(mgr.apply_gpu(sample_cfg(), 2)["gpu"], 2)
+        self.assertNotIn("gpu", mgr.apply_gpu(sample_cfg(), "auto"))
+        split = sample_cfg(gpu=[0, 1], gpus_asked=True)
+        self.assertEqual(mgr.apply_gpu(split, 2)["gpu"], [0, 1])   # a layer split is left alone
+
+
+class EditRoundTrip(unittest.TestCase):
+    def test_full_change_set(self):
+        cfg = sample_cfg()
+        out = mgr.edit_config(ROOT, cfg, {"context": 131072, "kv": "q4_0", "vision": "off",
+                                          "low_ram": True, "port": 8081, "host": "127.0.0.1",
+                                          "api_key": "", "gpu": "auto"}, low_ram_resident=False)
+        self.assertEqual(mgr.arg_val(out["args"], "--max-context"), "131072")
+        self.assertEqual(mgr.arg_val(out["args"], "--kv"), "q4_0")
+        self.assertEqual(mgr.low_ram_mode(out), "mmap")
+        self.assertEqual(out["port"], 8081)
+        # and the result is exactly what setup.py itself can read back
+        self.assertEqual(setup.choices_from_config.__name__, "choices_from_config")
+
+
+class SaveConfig(unittest.TestCase):
+    def test_atomic_write_and_backup(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "strata-x.json"
+            p.write_text(json.dumps(sample_cfg(), indent=1), encoding="utf-8")
+            new = dict(sample_cfg())
+            new["args"][new["args"].index("--max-context") + 1] = "65536"
+            mgr.save_config(p, new)
+            reread = json.loads(p.read_text(encoding="utf-8-sig"))
+            self.assertEqual(mgr.arg_val(reread["args"], "--max-context"), "65536")
+            backups = list(p.parent.glob("strata-x.json.bak-*"))
+            self.assertEqual(len(backups), 1)                    # one .bak of the previous version
+            self.assertIn("32768", backups[0].read_text(encoding="utf-8-sig"))
+
+    def test_rewrite_same_content_makes_no_backup(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "strata-x.json"
+            cfg = sample_cfg()
+            mgr.save_config(p, cfg)
+            mgr.save_config(p, cfg)
+            self.assertEqual(len(list(p.parent.glob("strata-x.json.bak-*"))), 0)
+
+
+class GgufDetection(unittest.TestCase):
+    def _dir(self, *names):
+        d = Path(tempfile.mkdtemp())
+        for n in names:
+            (d / n).write_bytes(b"x")
+        return d
+
+    def test_qwen_q2_0(self):
+        d = self._dir(SHARD1, SHARD2)
+        r = mgr.detect_gguf_dir(str(d))
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["family"], "qwen")
+        self.assertEqual(r["quant"], "Q2_0")
+        self.assertEqual(r["tag"], "q2_0")
+
+    def test_swift_iq3_xxs(self):
+        d = self._dir("Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+                      "Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf")
+        r = mgr.detect_gguf_dir(str(d))
+        self.assertEqual(r["family"], "swift")
+        self.assertEqual(r["quant"], "IQ3_XXS")
+
+    def test_coder(self):
+        d = self._dir("Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf",
+                      "Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf")
+        self.assertEqual(mgr.detect_gguf_dir(str(d))["family"], "coder")
+
+    def test_no_shards(self):
+        d = self._dir("readme.txt")
+        self.assertFalse(mgr.detect_gguf_dir(str(d))["ok"])
+
+
+class Discovery(unittest.TestCase):
+    def test_model_summary_and_order(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            a = root / "strata-q2_0.json"
+            b = root / "strata-iq3_xxs.json"
+            a.write_text(json.dumps(sample_cfg(model_name="qwen3.8-flash-next-q2_0"), indent=1),
+                         encoding="utf-8")
+            time = 1000000000
+            os.utime(a, (time, time))
+            b.write_text(json.dumps(sample_cfg(model_name="qwen3.8-flash-next-iq3_xxs",
+                                               args=["--max-context", "131072", "--kv", "int8",
+                                                     "--resident-experts"]), indent=1), encoding="utf-8")
+            os.utime(b, (time + 10, time + 10))
+            ms = mgr.discover(root)
+            self.assertEqual([m["config"] for m in ms], ["strata-iq3_xxs.json", "strata-q2_0.json"])
+            first = ms[0]
+            self.assertEqual(first["quant"], "IQ3_XXS")
+            self.assertEqual(first["context"], 131072)
+            self.assertEqual(first["low_ram"], "resident")
+            self.assertEqual(first["vision"], "off")
+
+
+class HttpRoundTrip(unittest.TestCase):
+    """A real Manager HTTP server against a temp Strata folder: the browser's own calls."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.td = tempfile.TemporaryDirectory()
+        cls.root = Path(cls.td.name)
+        cfg = sample_cfg()
+        (cls.root / "strata-q2_0.json").write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+        cls.server = mgr.make_server(cls.root, 0)
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.base = f"http://127.0.0.1:{cls.server.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.td.cleanup()
+
+    def get(self, path):
+        with urllib.request.urlopen(self.base + path, timeout=10) as r:
+            return r.status, r.read()
+
+    def post(self, path, obj):
+        req = urllib.request.Request(self.base + path, data=json.dumps(obj).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, json.loads(r.read())
+
+    def test_ui_and_models_serve(self):
+        status, html = self.get("/")
+        self.assertEqual(status, 200)
+        self.assertIn(b"Strata Manager", html)
+        status, _ = self.get("/app.css")
+        self.assertEqual(status, 200)
+        status, models = self.get("/api/models")
+        self.assertEqual(json.loads(models)["data"]["models"][0]["config"], "strata-q2_0.json")
+
+    def test_config_endpoint_edits_nothing(self):
+        status, data = self.get("/api/config?config=strata-q2_0.json")
+        self.assertEqual(status, 200)
+        before = self.root.joinpath("strata-q2_0.json").read_text(encoding="utf-8")
+        self.assertEqual(json.loads(data)["data"]["context"], 32768)
+        self.assertEqual(self.root.joinpath("strata-q2_0.json").read_text(encoding="utf-8"), before)
+
+    def test_save_round_trip_and_backup(self):
+        with mock.patch.object(setup, "gpus", return_value=[FAKE_GPU]):
+            with mock.patch.object(setup, "ram_gb", return_value=24.0):
+                status, data = self.post("/api/save", {"config": "strata-q2_0.json", "context": 131072,
+                                                       "kv": "q4_0", "vision": "off", "low_ram": True,
+                                                       "port": 8080, "host": "127.0.0.1", "api_key": "", "gpu": 0})
+        self.assertEqual(status, 200)
+        self.assertTrue(data["ok"])
+        reread = json.loads(self.root.joinpath("strata-q2_0.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual(mgr.arg_val(reread["args"], "--max-context"), "131072")
+        self.assertEqual(mgr.arg_val(reread["args"], "--kv"), "q4_0")
+        self.assertEqual(mgr.low_ram_mode(reread), "mmap")
+        self.assertIn("gpu", reread)
+        # the previous version is backed up and untouched
+        backups = list(self.root.glob("strata-q2_0.json.bak-*"))
+        self.assertEqual(len(backups), 1)
+        old = json.loads(backups[0].read_text(encoding="utf-8-sig"))
+        self.assertEqual(mgr.arg_val(old["args"], "--max-context"), "32768")
+        # saving the same values again creates no second backup
+        self.post("/api/save", {"config": "strata-q2_0.json", "context": 131072, "kv": "q4_0",
+                                "vision": "off", "low_ram": True, "port": 8080, "host": "127.0.0.1",
+                                "api_key": "", "gpu": 0})
+        self.assertEqual(len(list(self.root.glob("strata-q2_0.json.bak-*"))), 1)
+
+
+class LauncherTest(unittest.TestCase):
+    """The supervisor is platform-neutral: it never branches on the OS; the platform adapters do.  These
+    tests run the supervisor against a fake adapter, so they are valid on every OS."""
+
+    class FakeLauncher:
+        name = "fake"
+
+        def __init__(self):
+            self.spawned = []
+            self.terminated = []
+
+        def spawn(self, cmd, cwd, log_file):
+            self.spawned.append((cmd, cwd, log_file))
+            return 4242
+
+        def terminate(self, pid, grace_s):
+            self.terminated.append(pid)
+            return True
+
+        @staticmethod
+        def alive(pid):
+            return False
+
+    def setUp(self):
+        self.fake = self.FakeLauncher()
+        self.patch = mock.patch("gui.launcher.get_launcher", return_value=self.fake)
+        self.patch.start()
+        self.addCleanup(self.patch.stop)
+        self.td = tempfile.TemporaryDirectory()
+        self.addCleanup(self.td.cleanup)
+        self.root = Path(self.td.name)
+
+    def _write_state(self, **server):
+        mgr.launcher.ServerState(self.root).write({"server": server, "tool": None})
+
+    def test_platform_adapter_chosen_for_this_os(self):
+        from gui.platforms import get_launcher
+        if os.name == "nt":
+            from gui.platforms.windows import WindowsLauncher
+            self.assertIsInstance(get_launcher(), WindowsLauncher)
+        else:
+            from gui.platforms.linux import LinuxLauncher
+            self.assertIsInstance(get_launcher(), LinuxLauncher)
+
+    def test_start_command_is_platform_neutral(self):
+        import json as _json
+        exe = self.root / "strata"
+        exe.write_bytes(b"")
+        cfg = sample_cfg(exe=str(exe), args=[], port=18080)
+        (self.root / "strata-x.json").write_text(_json.dumps(cfg), encoding="utf-8")
+        r = mgr.start_server("strata-x.json", 18080, self.root)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(r["pid"], 4242)
+        cmd, cwd, _ = self.fake.spawned[0]
+        self.assertEqual(cwd, str(self.root))
+        self.assertTrue(any(part.endswith("server.py") for part in cmd))   # run-*.bat/.sh command
+        st = mgr.launcher.ServerState(self.root).read()
+        self.assertEqual(st["server"]["pid"], 4242)
+        self.assertEqual(st["server"]["platform"], "fake")
+
+    def test_duplicate_start_refused(self):
+        self._write_state(pid=9999, config="strata-x.json", port=18080, log="x")
+        exe = self.root / "strata"
+        exe.write_bytes(b"")
+        import json as _json
+        (self.root / "strata-x.json").write_text(_json.dumps(sample_cfg(exe=str(exe), port=18080)),
+                                                 encoding="utf-8")
+        with mock.patch("gui.launcher.probe_port", return_value=True):   # port answers = already running
+            r = mgr.start_server("strata-x.json", 18080, self.root)
+        self.assertFalse(r["ok"])
+        self.assertIn("already", r["error"])
+
+    def test_stop_clears_state_through_the_platform_adapter(self):
+        self._write_state(pid=9999, config="strata-x.json", port=18080, log="no.log")
+        r = mgr.stop_server(self.root)
+        self.assertEqual(r["state"], "stopped")
+        self.assertEqual(self.fake.terminated, [9999])
+        self.assertEqual(mgr.launcher.ServerState(self.root).read()["server"], None)
+
+    def test_stop_without_a_managed_server_is_a_noop(self):
+        r = mgr.stop_server(self.root)
+        self.assertEqual(r["state"], "stopped")
+        self.assertEqual(self.fake.terminated, [])
+
+    def test_linux_adapter_module_imports_everywhere(self):
+        from gui.platforms.linux import LinuxLauncher   # importable on any OS (calls are OS-conditional)
+        self.assertEqual(LinuxLauncher.name, "linux")
+
+
+class CrossPlatformPaths(unittest.TestCase):
+    """The Manager's path handling must not assume drive letters or backslashes (Linux: /mnt/Storage/Model)."""
+
+    def test_detect_works_with_forward_slash_paths(self):
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        (d / SHARD1).write_bytes(b"")
+        (d / SHARD2).write_bytes(b"")
+        posix_style = str(d).replace("\\", "/")          # exactly what a Linux path string looks like
+        r = mgr.detect_gguf_dir(posix_style)
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["quant"], "Q2_0")
+
+    def test_browse_uses_pathlib_only(self):
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        (d / "sub").mkdir()
+        b = mgr.Manager(ROOT).browse(str(d))
+        self.assertNotIn("error", b)
+        self.assertTrue(any(x.endswith("sub") for x in b["dirs"]))
+
+
+if __name__ == "__main__":
+    unittest.main()

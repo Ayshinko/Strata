@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Strata Manager</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+<header class="mh">
+  <div class="mh__brand">
+    <div class="mh__logo" aria-hidden="true">S</div>
+    <div>
+      <h1>Strata Manager</h1>
+      <p class="mh__sub">manages the Strata install it runs from — it does not run the model itself</p>
+    </div>
+  </div>
+  <div class="mh__side">
+    <div class="sys" id="sys-line">detecting GPU / RAM …</div>
+    <span class="pill" id="state-pill" data-state="unknown">…</span>
+  </div>
+</header>
+
+<main>
+  <section class="card editor" aria-label="Model settings">
+    <div class="row">
+      <label class="fld fld--grow" for="model-sel">Model</label>
+      <select id="model-sel" class="ctl ctl--grow">
+        <option value="">— no installed models —</option>
+      </select>
+    </div>
+
+    <div class="row">
+      <label class="fld" for="ctx-num">Context</label>
+      <input id="ctx-num" class="ctl num" type="number" min="1024" step="1024" value="32768" spellcheck="false">
+      <span class="fld-hint" id="ctx-hint"></span>
+    </div>
+    <div class="chips" id="ctx-chips"></div>
+
+    <fieldset class="row rf">
+      <legend class="fld">Vision</legend>
+      <label class="rad"><input type="radio" name="vision" value="off"><span>Off</span></label>
+      <label class="rad"><input type="radio" name="vision" value="gpu"><span>GPU</span></label>
+      <label class="rad"><input type="radio" name="vision" value="cpu"><span>CPU</span></label>
+      <span class="fld-hint" id="vision-hint"></span>
+    </fieldset>
+
+    <div class="row">
+      <label class="fld" for="lowram">Low RAM</label>
+      <input id="lowram" class="ctl checkbox" type="checkbox">
+      <span class="fld-hint" id="lowram-hint"></span>
+    </div>
+
+    <div class="row">
+      <label class="fld" for="gguf-path">Custom GGUF</label>
+      <input id="gguf-path" class="ctl ctl--grow mono" placeholder="a folder with …-0000N-of-00002.gguf files" spellcheck="false">
+      <button id="gguf-browse" class="btn" type="button">Browse…</button>
+      <button id="gguf-prepare" class="btn btn--accent" type="button" hidden>Prepare with Strata</button>
+    </div>
+    <p class="note" id="gguf-note"></p>
+
+    <details class="adv">
+      <summary>Advanced Settings</summary>
+      <div class="adv__body">
+        <div class="row">
+          <label class="fld" for="kv-sel">KV cache</label>
+          <select id="kv-sel" class="ctl">
+            <option value="int8">8-bit (default)</option>
+            <option value="q4_0">4-bit, Hadamard-rotated (half the memory)</option>
+            <option value="k8v4">Hybrid K8V4 (INT8 K + 4-bit V)</option>
+          </select>
+          <span class="fld-hint" id="kv-hint"></span>
+        </div>
+        <div class="row">
+          <label class="fld" for="gpu-sel">GPU</label>
+          <select id="gpu-sel" class="ctl">
+            <option value="auto">Auto (Strata's choice)</option>
+          </select>
+          <span class="fld-hint" id="gpu-hint"></span>
+        </div>
+        <div class="row">
+          <label class="fld" for="port-num">Port</label>
+          <input id="port-num" class="ctl num" type="number" min="1024" max="65535" value="8080">
+          <span class="fld-hint" id="port-hint"></span>
+        </div>
+        <div class="row">
+          <label class="fld" for="host-sel">Listen on</label>
+          <select id="host-sel" class="ctl">
+            <option value="127.0.0.1">127.0.0.1 — this PC only</option>
+            <option value="0.0.0.0">0.0.0.0 — other devices too</option>
+          </select>
+        </div>
+        <div class="row">
+          <label class="fld" for="api-key">API key</label>
+          <input id="api-key" class="ctl ctl--grow mono" type="password" placeholder="leave empty for no key" autocomplete="off">
+          <span class="fld-hint warn-ink" id="api-hint">required with 0.0.0.0</span>
+        </div>
+      </div>
+    </details>
+
+    <div class="actions">
+      <button id="save" class="btn btn--accent" type="button">Save Configuration</button>
+      <button id="start" class="btn btn--accent btn--big" type="button">▶&nbsp; START STRATA</button>
+      <button id="stop" class="btn" type="button" disabled>Stop</button>
+      <button id="restart" class="btn" type="button" disabled>Restart</button>
+    </div>
+  </section>
+
+  <section class="card" aria-label="Installed models">
+    <h2>Installed Models</h2>
+    <ul class="models" id="models"></ul>
+  </section>
+
+  <section class="card logcard" id="logcard" hidden aria-label="Server log">
+    <h2>Server log <span class="muted" id="log-where"></span></h2>
+    <pre class="log" id="logbox"></pre>
+  </section>
+</main>
+
+<div class="modal" id="browse-modal" hidden>
+  <div class="modal__box">
+    <h3>Choose a model folder</h3>
+    <p class="note">Strata's shards are named like <span class="mono">Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf</span>.</p>
+    <div class="dirline">
+      <input id="browse-path" class="ctl ctl--grow mono" spellcheck="false">
+      <button id="browse-go" class="btn" type="button">Go</button>
+    </div>
+    <ul class="dirs" id="browse-dirs"></ul>
+    <div id="browse-detect" class="note"></div>
+    <div class="modal__actions">
+      <button id="browse-use" class="btn btn--accent" type="button">Use this folder</button>
+      <button id="browse-close" class="btn" type="button">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+
+<template id="tpl-model">
+  <li class="model">
+    <div class="model__top">
+      <span class="model__title"></span>
+      <span class="badge quant"></span>
+      <span class="badge current" hidden>current</span>
+      <button class="btn btn--s select" type="button">Select</button>
+      <button class="btn btn--s edit" type="button">Edit</button>
+    </div>
+    <div class="model__meta"></div>
+    <div class="model__gguf mono"></div>
+  </li>
+</template>
+
+<script src="app.js"></script>
+</body>
+</html>

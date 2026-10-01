@@ -1,0 +1,212 @@
+"""gui/launcher - the Manager's supervisor: launching, stopping and restarting Strata's server.
+
+Platform-neutral: everything OS-specific (spawning a detached server, terminating its process tree) goes
+through `gui.platforms.get_launcher()`.  The manager never branches on the OS here; it only records state
+(logs/manager.json next to the Strata folder) and decides when a start/stop is safe.
+
+The launched command is the same one setup.py's generated run scripts run
+(`python serve/server.py --engine strata --config <cfg> --port <port>`), so a Mac/Windows/Linux Strata
+install behaves identically; on Windows the server is spawned without a console window, on Linux in its own
+session.  The Manager only supervises servers it started itself.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+from gui import platforms
+from gui.platforms import get_launcher
+
+ROOT = Path(__file__).resolve().parent.parent
+STATE_DIR_NAME = "logs"                 # runtime state next to the Strata folder (gitignored)
+STATE_FILE = "manager.json"
+SERVE_LOG_SUFFIX = ".serve.log"         # the Server's stdout when launched by the Manager (strata-*.log)
+PROBE_TIMEOUT = 1.0                     # seconds for the "is the port answering?" checks
+SHUTDOWN_GRACE_S = 15.0
+
+
+class ServerState:
+    """The Manager's runtime state file (<strata>/logs/manager.json, gitignored): which server process it
+    launched and which setup.py helper (custom GGUF) it is running."""
+
+    def __init__(self, root: Path = ROOT):
+        self.path = root / STATE_DIR_NAME / STATE_FILE
+
+    def read(self) -> dict:
+        try:
+            st = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            st = {}
+        return {k: st.get(k) for k in ("server", "tool")}
+
+    def write(self, st: dict) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(st, indent=1), encoding="utf-8")
+        os.replace(tmp, self.path)
+
+
+def read_config(path: Path) -> dict:
+    """A strata-*.json config, as JSON (BOM-tolerant, like setup.py)."""
+    return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def gguf_paths(cfg: dict) -> list:
+    """The GGUF shards the config points at (--native and --ple-gguf, in setup.py's order)."""
+    args = cfg.get("args", [])
+    return [p for p in (arg_val(args, "--native"), arg_val(args, "--ple-gguf")) if p]
+
+
+def arg_val(args: list, key: str, default=None):
+    try:
+        i = args.index(key)
+        return args[i + 1] if i >= 0 and i + 1 < len(args) else default
+    except ValueError:
+        return default
+
+
+def probe_port(host: str, port: int, timeout: float = PROBE_TIMEOUT) -> bool:
+    """Is anything listening on host:port?"""
+    import socket
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def strata_ready(port: int, host: str = "127.0.0.1", timeout: float = PROBE_TIMEOUT) -> bool:
+    """The pick-you-up check a chat client would use: GET /v1/models answers with Strata's JSON."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(f"http://{host}:{port}/v1/models", timeout=timeout) as r:
+            return r.status == 200 and b'"object"' in r.read(65536)
+    except (OSError, ValueError):
+        return False
+
+
+def pid_alive(pid: int) -> bool:
+    return get_launcher().alive(pid)
+
+
+def server_status(root: Path = ROOT) -> dict:
+    """stopped | starting | running.  The port is the ground truth (Strata answers it once the model is
+    loaded); the remembered PID distinguishes "starting" from "stopped"."""
+    st = ServerState(root).read()
+    srv = st.get("server") or {}
+    pid, port, name = srv.get("pid"), srv.get("port"), srv.get("config")
+    if name:
+        try:
+            port = port or read_config(root / name).get("port", 8080)
+        except (OSError, ValueError):
+            pass
+    if port and probe_port("127.0.0.1", port):
+        return {"state": "running", "port": port, "pid": pid, "config": name,
+                "ready": strata_ready(port), "log": srv.get("log")}
+    if pid_alive(pid):
+        return {"state": "starting", "port": port, "pid": pid, "config": name, "ready": False,
+                "log": srv.get("log")}
+    return {"state": "stopped", "port": port, "config": name, "ready": False}
+
+
+def start_server(name: str, port: int | None, root: Path = ROOT, open_chat: bool = False) -> dict:
+    """Launch Strata's server for an installed model the way run-*.bat / run-*.sh do (same serve/server.py,
+    same config), detached, with its stdout in strata-<m>.serve.log.  Port-lock checks first - Strata's
+    server refuses to start twice by itself; this must not even try."""
+    cfg_path = root / name
+    try:
+        cfg = read_config(cfg_path)
+    except (OSError, ValueError):
+        return {"ok": False, "error": f"cannot read {name} - is it a Strata config?"}
+    port = port or cfg.get("port", 8080)
+    status = server_status(root)
+    if status["state"] in ("running", "starting"):
+        return {"ok": False, "state": status["state"],
+                "error": f"Strata is already {status['state']} (config {status.get('config')})."}
+    if probe_port("127.0.0.1", port):
+        return {"ok": False, "error": f"something else is already listening on port {port}: another Strata "
+                "console, or another local server. Close it first - the Manager must not launch a second "
+                "instance."}
+    if not Path(cfg.get("exe", "")).exists():
+        return {"ok": False, "error": f"the engine in this config is missing: {cfg.get('exe')} - run "
+                "SETUP.bat / setup.sh to repair the install."}
+    missing = [p for p in gguf_paths(cfg) if not Path(p).exists()]
+    if missing:
+        return {"ok": False, "error": f"this config refers to missing model files: {missing[0]} - run "
+                "the setup again to repair it."}
+    cmd = [sys.executable, str(root / "serve" / "server.py"), "--engine", "strata",
+           "--config", str(cfg_path), "--port", str(port)]
+    log_path = root / (cfg_path.name[:-5] + SERVE_LOG_SUFFIX)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    launcher = get_launcher()
+    pid = launcher.spawn(cmd, str(root), log_path)
+    ServerState(root).write({**ServerState(root).read(), "server": {
+        "pid": pid, "config": name, "port": port, "log": str(log_path),
+        "started": time.strftime("%Y-%m-%d %H:%M:%S"), "cmd": cmd, "platform": launcher.name}})
+    if open_chat:
+        import webbrowser
+        webbrowser.open(f"http://127.0.0.1:{port}/")
+    return {"ok": True, "state": "starting", "pid": pid, "port": port, "log": str(log_path)}
+
+
+def stop_server(root: Path = ROOT) -> dict:
+    """Stop the server the Manager started, through the platform adapter (Windows: close the process tree
+    like closing Strata's console; Linux: graceful SIGTERM to the server's group, force after grace)."""
+    st = ServerState(root).read()
+    srv = st.get("server") or {}
+    pid = srv.get("pid")
+    if not pid:
+        # not started by the Manager: maybe another console; only the port can tell
+        for name in sorted(p.name for p in (root.glob("strata-*.json")) if p.is_file()):
+            try:
+                port = read_config(root / name).get("port", 8080)
+            except (OSError, ValueError):
+                continue
+            if probe_port("127.0.0.1", port):
+                return {"ok": True, "state": "running", "note": "Strata is running from another window; close "
+                        "that window to stop it (the Manager only stops what it started)."}
+        return {"ok": True, "state": "stopped", "note": "not running"}
+    get_launcher().terminate(int(pid), SHUTDOWN_GRACE_S)
+    st2 = ServerState(root).read()
+    st2.pop("server", None)
+    ServerState(root).write(st2)
+    return {"ok": True, "state": "stopped"}
+
+
+def restart_server(name: str, port: int | None, root: Path = ROOT, open_chat: bool = False) -> dict:
+    stop_server(root)
+    for _ in range(20):                                  # let the port free up
+        if not probe_port("127.0.0.1", port or 8080):
+            break
+        time.sleep(0.5)
+    return start_server(name, port, root, open_chat=open_chat)
+
+
+def run_tool(cmd: list, log_path: Path, what: str, root: Path = ROOT) -> dict:
+    """Launch a detached helper (today: setup.py's own custom-GGUF install), remember it in the runtime state,
+    stream its output into a log the UI can tail.  Returns the recorded tool description."""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    pid = get_launcher().spawn(cmd, str(root), log_path)
+    st = ServerState(root).read()
+    st["tool"] = {"pid": pid, "log": str(log_path), "what": what, "started": time.time()}
+    ServerState(root).write(st)
+    return st["tool"]
+
+
+def tail_lines(path: str | Path, n: int = 200) -> str:
+    """The last n lines of a log (server/engine logs are plain text)."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 131072))                # at most 128 KB read
+            data = f.read().decode("utf-8", "replace")
+        return "\n".join(data.splitlines()[-n:])
+    except OSError:
+        return ""
