@@ -1,13 +1,92 @@
-/* Strata Manager - vanilla JS, no framework.  Talks to gui/manager.py's local JSON API only. */
+/* gui/web/app.js - the unified shell of the Strata Manager page.  It runs AFTER serve/web/app.js
+   (loaded as web/serve-app.js), which already implements Chat, Monitor, About, Markdown, the sampling
+   drawer and the theme - untouched, against the SAME origin (the Manager's port proxies the Strata
+   server's endpoints, so no CORS and no copied code).  This file adds:
+
+     - the fourth tab (Manager): the model editor, lifecycle buttons, models list, logs, system info
+     - the hash-based navigation over manager|chat|monitor|about (default #manager); Start/Restart never
+       change the current page
+     - the offline awareness: while Strata is stopped/starting/restarting, Chat/Monitor/About show a
+       clean offline state and the model APIs are not polled; when Strata answers again (also when it
+       was started externally), everything resumes by itself
+     - the lifecycle pill: "External" detection disables Start/Stop/Restart so the Manager never owns
+       a process it did not start
+
+   It deliberately does NOT re-declare anything serve/web/app.js already provides ($, store, tab, busy,
+   toast, poll, showTab, setPill, setBusy, ...): those live in the shared global scope.  The few places
+   where this shell must change their behavior are patched through window.* after capturing the originals.
+*/
 "use strict";
 
-const $ = (id) => document.getElementById(id);
-const POLL_MS = 4000;
-
-const state = { models: [], editor: null, status: { server: { state: "unknown" } }, tool: null,
-                busy: false, ggufDetect: null };
+/* ---------------------------------------------------------------- lifecycle bookkeeping */
+const MG_POLL_MS = 2000;
+const mgState = { models: [], editor: null, status: { server: { state: "unknown" } }, tool: null,
+                  busy: false, ggufDetect: null };
 // the running operation (Stop / Force Stop / Restart): shown immediately on click, updated by polling.
-const op = { state: null, phase: null, since: 0, lastDone: null, ticker: null };
+const mgOp = { state: null, phase: null, since: 0, ticker: null };
+let mgOnline = false;                        // is Strata's server answering? (running or external)
+
+const MG_PILL_TEXT = { running: "Running", starting: "Starting…", stopping: "Stopping…",
+                       restarting: "Restarting…", external: "Running · External",
+                       error: "Error", stopped: "Stopped", unknown: "…" };
+const MG_PILL_DOT = { running: "generating", external: "generating", starting: "queued",
+                      stopping: "queued", restarting: "queued", error: "queued",
+                      stopped: "idle", unknown: "queued" };
+
+/* ---------------------------------------------------------------- offline gating
+   The Strata APIs (health, metrics, mcp, settings, v1/*, ...) run on THIS origin through the Manager
+   gateway.  While Strata is down they are not worth polling: reject them before they hit the wire, so
+   the serve/web/app.js poll/send loops just see a failed request and this shell paints the lifecycle
+   pill instead.  The Manager's own /api/* stays reachable always - that is what keeps the page alive. */
+function mgIsManagerUrl(url) {
+  return typeof url === "string" && (url.startsWith("/api/") || url.startsWith("/web/") ||
+         url.startsWith("/fonts/"));
+}
+const _baseFetch = window.fetch;
+window.fetch = function (url, opts) {
+  if (!mgOnline && !mgIsManagerUrl(url)) return Promise.reject(new TypeError("Strata is not running"));
+  return _baseFetch(url, opts);
+};
+
+const _baseSetPill = window.setPill;
+window.setPill = function (state, text) {
+  if (!mgOnline) {                               // the model state is meaningless: show the lifecycle
+    const st = mgState.status.server ? mgState.status.server.state : "unknown";
+    $("pill").dataset.state = MG_PILL_DOT[st] || "idle";
+    $("pill-text").textContent = MG_PILL_TEXT[st] || st;
+    return;
+  }
+  _baseSetPill(state, text);
+};
+
+const _basePoll = window.poll;
+window.poll = function () {
+  if (!mgOnline) { setTimeout(window.poll, 1000); return; }
+  _basePoll();
+};
+
+const _baseSetBusy = window.setBusy;
+window.setBusy = function (on) {
+  _baseSetBusy(on);
+  if (!mgOnline && $("send-btn")) $("send-btn").disabled = true;
+};
+
+/* ---------------------------------------------------------------- navigation
+   The shell's own tab logic (serve/app.js's is Chat/Monitor/About only).  The selected page is kept in
+   the hash (#manager default) and remembered, and nothing here ever navigates away - Start / Restart
+   leave the user exactly on the page they are viewing. */
+const _baseShowTab = window.showTab;
+window.showTab = function (name) {
+  tab = ["manager", "chat", "monitor", "about"].includes(name) ? name : "manager";
+  for (const b of document.querySelectorAll(".st-tab")) b.setAttribute("aria-selected", String(b.dataset.tab === tab));
+  for (const v of ["manager", "chat", "monitor", "about"]) { const el = $(`view-${v}`); if (el) el.hidden = v !== tab; }
+  if (location.hash.slice(1) !== tab) history.replaceState(null, "", `#${tab}`);
+  store.set("lasttab", tab);
+  if (tab === "chat") $("input").focus();
+  if (tab === "monitor") loadMcp();
+  if (lastMetrics) render(lastMetrics);
+};
+// serve/web/app.js already registered window's hashchange -> showTab(hash); it now resolves to this shell.
 
 /* ---------------------------------------------------------------- API */
 async function api(path, opts) {
@@ -24,120 +103,137 @@ function post(path, body) {
                      body: JSON.stringify(body) });
 }
 
-/* ---------------------------------------------------------------- toast */
-let toastTimer = null;
-function toast(msg, kind) {
-  const t = $("toast");
-  t.textContent = msg;
-  t.dataset.kind = kind || "";
-  t.hidden = false;
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => { t.hidden = true; }, kind === "error" ? 7000 : 5000);
+/* ---------------------------------------------------------------- toasts (the serve app's style) */
+function mgToast(msg, kind) {
+  toast(kind === "ok" ? "success" : kind === "error" ? "error" : "info", msg);
 }
 
-/* ---------------------------------------------------------------- system + state pill */
-async function refreshSystem() {
+/* ---------------------------------------------------------------- system + lifecycle display */
+async function mgRefreshSystem() {
   try {
     const s = await api("/api/system");
-    const g = s.gpus.map(g =>
+    const g = (s.gpus || []).map(g =>
       `${g.name} · ${Math.round(g.vram_used_gb || 0)}/${g.vram_gb.toFixed(0)} GB VRAM`).join(" · ");
     const ram = s.ram_gb ? ` · RAM ${s.ram_used_gb != null ? Math.round(s.ram_used_gb) + "/" : ""}${Math.round(s.ram_gb)} GB` : "";
-    $("sys-line").textContent = `Strata v${s.strata_version} · ${s.cpu} · ${g || "no NVIDIA GPU"}${ram}`;
+    $("sys-line").textContent = `Strata v${s.strata_version} · ${s.cpu || "?"} · ${g || "no NVIDIA GPU"}${ram}`;
   } catch (e) { $("sys-line").textContent = "GPU / RAM unavailable: " + e.message; }
 }
 
-const PILL_TEXT = { "running": "running", "starting": "starting…", "stopped": "stopped",
-                    "stopping": "stopping…", "restarting": "restarting…",
-                    "error": "error", "unknown": "…" };
-function setPill(status, note) {
+function mgSetPill() {
+  const srv = mgState.status.server || { state: "unknown" };
   const p = $("state-pill");
-  p.dataset.state = status.state || "unknown";
-  p.textContent = (PILL_TEXT[status.state] || status.state) + (note ? ` — ${note}` : "");
+  if (!p) return;
+  p.dataset.state = srv.state || "unknown";
+  const note = srv.state === "running" ? `port ${srv.port}`
+              : srv.state === "external" ? "started outside the Manager" : "";
+  p.textContent = (MG_PILL_TEXT[srv.state] || srv.state) + (note ? ` — ${note}` : "");
 }
 
-/* ---------------------------------------------------------------- operation display */
-const OP_PHASE = {
-  stopping:  { stopping: "Stopping Strata…", graceful: "Gracefully shutting down the engine", forcing: "Force-stopping…" },
+function applyOnline() {
+  const st = mgState.status.server ? mgState.status.server.state : "unknown";
+  mgOnline = st === "running" || st === "external";
+  for (const id of ["chat-offline", "monitor-offline", "about-offline"]) {
+    const el = $(id); if (el) el.hidden = mgOnline;
+  }
+  if ($("input")) $("input").disabled = !mgOnline;
+  if ($("send-btn")) $("send-btn").disabled = !mgOnline || !!busy;
+  for (const id of ["attach-btn", "new-btn", "export-btn", "sampling-btn"]) {
+    const el = $(id); if (el) el.disabled = !mgOnline;
+  }
+  const ex = $("external-note");
+  if (ex) ex.hidden = st !== "external";
+  window.setPill("idle", "");                        // repaint the header pill now, not on the next tick
+}
+
+/* ---------------------------------------------------------------- the running operation display */
+const MG_OP_PHASE = {
+  stopping: { stopping: "Stopping Strata…", graceful: "Gracefully shutting down the engine", forcing: "Force-stopping…" },
   restarting: { stopping: "Restarting… (stopping)", starting: "Restarting… (starting)", running: "Restarting… (running)" },
 };
-const OP_TITLE = { stopping: "Stopping Strata", restarting: "Restarting Strata" };
+const MG_OP_TITLE = { stopping: "Stopping Strata", restarting: "Restarting Strata" };
 
 function setOp(stateName, phase, elapsed) {
-  if (op.state !== stateName || op.phase !== phase) {
-    op.state = stateName;
-    op.phase = phase;
-    op.since = Date.now() - (elapsed != null ? elapsed * 1000 : 0);
+  if (mgOp.state !== stateName || mgOp.phase !== phase) {
+    mgOp.state = stateName; mgOp.phase = phase;
+    mgOp.since = Date.now() - (elapsed != null ? elapsed * 1000 : 0);
   } else if (elapsed != null) {
-    op.since = Date.now() - elapsed * 1000;              // keep in step with the backend's clock
+    mgOp.since = Date.now() - elapsed * 1000;        // keep in step with the backend's clock
   }
   $("op").hidden = false;
-  if (op.ticker == null) {
-    op.ticker = setInterval(opTick, 250);
-  }
+  if (mgOp.ticker == null) mgOp.ticker = setInterval(opTick, 250);
   opTick();
 }
 
 function opTick() {
-  const table = OP_PHASE[op.state] || {};
-  const base = table[op.phase] || OP_TITLE[op.state] || "Working…";
-  const s = Math.max(0, (Date.now() - op.since) / 1000);
+  const table = MG_OP_PHASE[mgOp.state] || {};
+  const base = table[mgOp.phase] || MG_OP_TITLE[mgOp.state] || "Working…";
+  const s = Math.max(0, (Date.now() - mgOp.since) / 1000);
   $("op-text").textContent = `${base}  ${s.toFixed(1)}s`;
 }
 
 function clearOp() {
-  op.state = null;
-  op.phase = null;
-  $("op").hidden = true;
-  if (op.ticker != null) { clearInterval(op.ticker); op.ticker = null; }
+  mgOp.state = null; mgOp.phase = null;
+  const op = $("op"); if (op) op.hidden = true;
+  if (mgOp.ticker != null) { clearInterval(mgOp.ticker); mgOp.ticker = null; }
 }
 
-function fmtElapsed(secs) {
-  return secs != null ? `${secs.toFixed(1)}s` : "";
-}
+function fmtElapsed(secs) { return secs != null ? `${secs.toFixed(1)}s` : ""; }
 
 /* ---------------------------------------------------------------- status + buttons */
 function refreshButtons() {
-  const s = state.status.server;
+  const s = mgState.status.server || { state: "unknown" };
   const st = s.state;
-  const inOp = (st === "stopping" || st === "restarting");
-  $("start").disabled = state.busy || inOp || st === "running" || st === "starting" || !state.models.length;
-  $("stop").disabled = state.busy || inOp || (st !== "running" && st !== "starting");
-  $("restart").disabled = state.busy || inOp || st !== "running";
+  const inOp = st === "stopping" || st === "restarting";
+  const external = st === "external";
+  $("start").disabled = mgState.busy || inOp || external || st === "running" || st === "starting" || !mgState.models.length;
+  $("stop").disabled = mgState.busy || inOp || external || (st !== "running" && st !== "starting");
+  $("restart").disabled = mgState.busy || inOp || external || st !== "running";
   $("force-stop").hidden = !inOp;
-  $("save").disabled = state.busy || !state.editor;
+  $("save").disabled = mgState.busy || !mgState.editor;
 }
 
 async function refreshStatus() {
   try {
     const st = await api("/api/status");
-    const prev = state.status.server ? state.status.server.state : "unknown";
-    state.status = st;
-    state.tool = st.tool;
+    const prev = mgState.status.server ? mgState.status.server.state : "unknown";
+    mgState.status = st;
+    mgState.tool = st.tool;
+    const srv = st.server || { state: "unknown" };
 
-    const srv = st.server;
     if (srv.state === "stopping" || srv.state === "restarting") {
       setOp(srv.state, srv.phase, srv.elapsed);
-      setPill(srv, srv.phase === "forcing" ? "force-stopping" : srv.phase);
     } else {
-      if (op.state === "restarting" && srv.state === "running") {
-        const secs = Math.max(0, (Date.now() - op.since) / 1000);
+      if (mgOp.state === "restarting" && srv.state === "running") {
+        const secs = Math.max(0, (Date.now() - mgOp.since) / 1000);
         clearOp();
-        toast(`Restarted in ${secs.toFixed(1)}s — the model is serving again (port ${srv.port})`, "ok");
-      } else if (op.state === "restarting" || op.state === "stopping") {
-        clearOp();                                        // stopped (or crashed) - the response already said why
+        mgToast(`Restarted in ${secs.toFixed(1)}s — the model is serving again (port ${srv.port})`, "ok");
+      } else if (mgOp.state === "restarting" || mgOp.state === "stopping") {
+        clearOp();                                    // stopped (or crashed) - the response already said why
       }
       if (srv.state === "error") {
-        setPill(srv, (srv.error || "exited unexpectedly") + " — see Server log");
-      } else {
-        setPill(srv, srv.state === "running" ? `port ${srv.port}` : "");
+        clearOp();
+        mgToast((srv.error || "the server exited unexpectedly") + " — see the Server log", "error");
       }
-      if (prev === "resumed") { /* ignore */ }
     }
+
+    if (prev !== "external" && srv.state === "external") {
+      mgToast("Strata is running, started outside the Manager. Close its console to stop it.", "info");
+    }
+    if (prev !== "running" && srv.state === "running" && mgOp.state == null) {
+      mgToast(`Strata is running (port ${srv.port}).`, "ok");
+    }
+    if (prev === "external" && srv.state === "stopped") {
+      mgToast("The external Strata instance stopped.", "info");
+    }
+
+    mgSetPill();
+    applyOnline();
     refreshButtons();
     handleLog();
     handleTool();
   } catch (e) {
-    setPill({ state: "error" }, e.message);
+    mgSetPill();
+    refreshButtons();
   }
 }
 
@@ -146,7 +242,7 @@ function renderModels(defaultName) {
   const ul = $("models");
   ul.textContent = "";
   const tpl = $("tpl-model");
-  for (const m of state.models) {
+  for (const m of mgState.models) {
     const li = tpl.content.firstElementChild.cloneNode(true);
     li.className = "model";
     li.querySelector(".model__title").textContent = m.title;
@@ -176,8 +272,8 @@ function renderModels(defaultName) {
     });
     ul.appendChild(li);
   }
-  ul.hidden = !state.models.length;
-  if (!state.models.length) {
+  ul.hidden = !mgState.models.length;
+  if (!mgState.models.length) {
     const li = document.createElement("li");
     li.className = "model";
     li.innerHTML = `<div class="model__title">None yet</div>
@@ -190,18 +286,18 @@ function renderModels(defaultName) {
 function renderModelSelect(defaultName) {
   const sel = $("model-sel");
   sel.textContent = "";
-  for (const m of state.models) {
+  for (const m of mgState.models) {
     const o = document.createElement("option");
     o.value = m.config;
     o.textContent = `${m.title}  (${m.quant || m.family || "?"} · ${m.context ? m.context.toLocaleString() : "?"} ctx)`;
     sel.appendChild(o);
   }
-  sel.value = defaultName && state.models.length ? defaultName : (state.models[0] || {}).config || "";
+  sel.value = defaultName && mgState.models.length ? defaultName : (mgState.models[0] || {}).config || "";
 }
 
 /* ---------------------------------------------------------------- editor */
 function fillEditor() {
-  const e = state.editor, s = e.summary;
+  const e = mgState.editor, s = e.summary;
   $("ctx-num").value = e.context || 32768;
   renderChips(e);
   updateCtxHint();
@@ -220,7 +316,7 @@ function fillEditor() {
   fillGpu(e);
   $("port-num").value = e.port || 8080;
   $("host-sel").value = (e.host === "0.0.0.0") ? "0.0.0.0" : "127.0.0.1";
-  $("api-key").value = e.api_key || "";
+  $("mg-api-key").value = e.api_key || "";
   $("vision-hint").textContent = e.vision_available ? "" : "Vision not installed for this model — run SETUP.bat --vision to add it (the Manager never downloads).";
   for (const r of document.querySelectorAll('input[name="vision"]')) r.disabled = !e.vision_available;
   const firstGguf = s.gguf && s.gguf[0];
@@ -277,10 +373,10 @@ function syncChips() {
 
 function updateCtxHint() {
   const v = parseInt($("ctx-num").value, 10) || 0;
-  $("ctx-hint").textContent = v > state.editor.trained_context
+  $("ctx-hint").textContent = v > mgState.editor.trained_context
     ? "past the trained 262144: the setup adds yarn rope scaling (factor " + (v / 262144).toFixed(2) + ")"
     : v > 0 ? "tokens the model can see at once" : "";
-  if (state.editor) {
+  if (mgState.editor) {
     $("kv-hint").textContent = v > 8192 ? "above 8K context; the engine streams it from 64K up" : "below 8K context the engine uses fp16 (no flag)";
     $("kv-sel").disabled = !(v > 8192);
   }
@@ -288,19 +384,19 @@ function updateCtxHint() {
 
 async function selectModel(name) {
   if (!name) return;
-  state.busy = true;
+  mgState.busy = true;
   try {
     const e = await api("/api/config?config=" + encodeURIComponent(name));
-    state.editor = e;
+    mgState.editor = e;
     fillEditor();
     $("model-sel").value = name;
-  } catch (err) { toast(err.message, "error"); }
-  state.busy = false;
+  } catch (err) { mgToast(err.message, "error"); }
+  mgState.busy = false;
   refreshButtons();
 }
 
 function editorChanges() {
-  const e = state.editor;
+  const e = mgState.editor;
   const board = {
     config: e.summary.config,
     context: parseInt($("ctx-num").value, 10) || e.context,
@@ -309,7 +405,7 @@ function editorChanges() {
     low_ram: $("lowram").checked,
     port: parseInt($("port-num").value, 10) || e.port,
     host: $("host-sel").value,
-    api_key: $("api-key").value.trim(),
+    api_key: $("mg-api-key").value.trim(),
     gpu: $("gpu-sel").value,
   };
   if (Array.isArray(e.gpu)) delete board.gpu;      // a layer split is not edited here
@@ -317,86 +413,87 @@ function editorChanges() {
 }
 
 async function doSave() {
-  if (!state.editor) return;
-  state.busy = true; refreshButtons();
+  if (!mgState.editor) return;
+  mgState.busy = true; refreshButtons();
   try {
     await post("/api/save", editorChanges());
-    toast("saved — Strata reads the same config file format", "ok");
+    mgToast("saved — Strata reads the same config file format", "ok");
     await reloadModels();
-    await selectModel(state.editor.summary.config);
-  } catch (err) { toast(err.message, "error"); }
-  state.busy = false; refreshButtons();
+    await selectModel(mgState.editor.summary.config);
+  } catch (err) { mgToast(err.message, "error"); }
+  mgState.busy = false; refreshButtons();
 }
 
-/* ---------------------------------------------------------------- start / stop / restart */
+/* ---------------------------------------------------------------- start / stop / restart
+   All of these only talk to the Manager API on this origin - nothing ever opens another URL, another
+   tab, or navigates away: the polls below walk Stopping/Restarting/Starting/Running on the SAME page. */
 async function doStart() {
-  if (!state.editor) return;
-  state.busy = true; refreshButtons();
+  if (!mgState.editor) return;
+  mgState.busy = true; refreshButtons();
   try {
-    const r = await post("/api/start", { config: state.editor.summary.config,
+    const r = await post("/api/start", { config: mgState.editor.summary.config,
                                          port: parseInt($("port-num").value, 10) || undefined,
                                          open_chat: false });
-    if (r.error) { toast(r.error, "error"); }
-    else toast("starting Strata — the model loads in the background", "ok");
+    if (r.error) { mgToast(r.error, "error"); }
+    else mgToast("starting Strata — the model loads in the background", "ok");
     await refreshStatus();
-  } catch (err) { toast(err.message, "error"); }
-  state.busy = false; refreshButtons();
+  } catch (err) { mgToast(err.message, "error"); }
+  mgState.busy = false; refreshButtons();
 }
 
 async function doStop() {
-  if (!state.editor) return;
+  if (!mgState.editor) return;
   setOp("stopping", "graceful");                       // react instantly: don't wait for the API call
   refreshButtons();
   try {
     const r = await post("/api/stop");
     const t = r.elapsed_s != null ? `Stopped in ${fmtElapsed(r.elapsed_s)}` : "Stopped";
-    toast(r.forced ? `${t} — the graceful shutdown timed out, so the process tree was force-closed`
-                   : `${t} — graceful shutdown`, "ok");
-  } catch (err) { toast(err.message, "error"); }
+    mgToast(r.forced ? `${t} — the graceful shutdown timed out, so the process tree was force-closed`
+                     : `${t} — graceful shutdown`, "ok");
+  } catch (err) { mgToast(err.message, "error"); }
   clearOp();                                           // the next status poll confirms "stopped"
   await refreshStatus();
 }
 
 async function doForceStop() {
-  if (!state.editor) return;
+  if (!mgState.editor) return;
   setOp("stopping", "forcing");
   refreshButtons();
   try {
     const r = await post("/api/force-stop");
-    toast(`Force-stopped in ${fmtElapsed(r.elapsed_s)} — the process tree was terminated immediately`, "ok");
-  } catch (err) { toast(err.message, "error"); }
+    mgToast(`Force-stopped in ${fmtElapsed(r.elapsed_s)} — the process tree was terminated immediately`, "ok");
+  } catch (err) { mgToast(err.message, "error"); }
   clearOp();
   await refreshStatus();
 }
 
 async function doRestart() {
-  if (!state.editor) return;
+  if (!mgState.editor) return;
   setOp("restarting", "stopping");
   refreshButtons();
   try {
     const r = await post("/api/restart", {
-      config: state.editor.summary.config,
+      config: mgState.editor.summary.config,
       port: parseInt($("port-num").value, 10) || undefined,
       open_chat: false,
     });
-    if (r.error) { toast(r.error, "error"); clearOp(); }
-    // otherwise: the operation indicator stays up; polls walk it through stopping → starting → running,
-    // and refreshStatus() shows "Restarted — the model is serving again" when it reaches running.
-  } catch (err) { toast(err.message, "error"); clearOp(); }
+    if (r.error) { mgToast(r.error, "error"); clearOp(); }
+    // otherwise the operation indicator stays up; polls walk it through stopping → starting → running.
+  } catch (err) { mgToast(err.message, "error"); clearOp(); }
   refreshButtons();
 }
 
 /* ---------------------------------------------------------------- log + tool */
-let logRefreshAt = 0;
+let mgLogRefreshAt = 0;
 async function handleLog() {
-  const s = state.status.server;
-  if (!s.log) return;
+  const s = mgState.status.server;
+  if (!s || !s.log) return;
   const showState0 = s.state === "starting" || s.state === "running" || s.state === "error";
-  const showState = op.state != null || showState0;     // mid-operation: leave the last log visible
+  const showState = mgOp.state != null || showState0;  // mid-operation: leave the last log visible
   if (!showState) { $("logcard").hidden = true; return; }
   const now = Date.now();
-  if (now < logRefreshAt) return;
-  logRefreshAt = now + 3000;
+  if (now < mgLogRefreshAt) return;
+  mgLogRefreshAt = now + 3000;
   $("logcard").hidden = false;
   $("log-where").textContent = s.config || "";
   try {
@@ -408,7 +505,7 @@ async function handleLog() {
 }
 
 function handleTool() {
-  const t = state.tool;
+  const t = mgState.tool;
   if (!t) { $("gguf-note").textContent = ""; return; }
   const alive = t.alive;
   const el = Math.round((Date.now() / 1000) - (t.started || 0));
@@ -417,11 +514,11 @@ function handleTool() {
 }
 
 /* ---------------------------------------------------------------- browse + custom GGUF */
-let browsePath = "";
+let mgBrowsePath = "";
 async function openBrowse(startPath) {
   const d = await api("/api/browse", { method: "POST", headers: { "Content-Type": "application/json" },
-                                       body: JSON.stringify({ path: startPath || browsePath }) });
-  browsePath = d.path;
+                                       body: JSON.stringify({ path: startPath || mgBrowsePath }) });
+  mgBrowsePath = d.path;
   $("browse-path").value = d.path;
   $("browse-modal").hidden = false;
   renderDirs(d);
@@ -452,13 +549,13 @@ function renderDirs(d) {
 async function setBrowseDir(path) {
   const d = await api("/api/browse", { method: "POST", headers: { "Content-Type": "application/json" },
                                        body: JSON.stringify({ path }) });
-  browsePath = d.path;
+  mgBrowsePath = d.path;
   $("browse-path").value = d.path;
   renderDirs(d);
 }
 
 async function browsePreview(path) {
-  browsePath = path;
+  mgBrowsePath = path;
   const dd = $("browse-detect");
   try {
     const det = await api("/api/gguf-detect", { method: "POST", headers: { "Content-Type": "application/json" },
@@ -467,54 +564,57 @@ async function browsePreview(path) {
       dd.textContent = `✓ ${det.family_title} ${det.quant} — shards: ${det.shards.join(", ")}`;
       dd.dataset.ok = "1";
       $("gguf-prepare").hidden = !det.tag;
-      state.ggufDetect = det;
+      mgState.ggufDetect = det;
     } else {
       dd.textContent = det.error;
       dd.dataset.ok = "0";
       $("gguf-prepare").hidden = true;
-      state.ggufDetect = null;
+      mgState.ggufDetect = null;
     }
   } catch (e) { dd.textContent = e.message; }
 }
 
 function useBrowseFolder() {
   $("browse-modal").hidden = true;
-  $("gguf-path").value = browsePath;
-  browsePreview(browsePath);
+  $("gguf-path").value = mgBrowsePath;
+  browsePreview(mgBrowsePath);
 }
 
 async function doPrepareGguf() {
-  const det = state.ggufDetect;
+  const det = mgState.ggufDetect;
   if (!det) return;
   try {
     const r = await post("/api/prepare-gguf", { path: det.dir, context: parseInt($("ctx-num").value, 10) || 32768 });
-    if (r.already) { toast(`already installed as ${r.config}`, "ok"); await selectModel(r.config); return; }
-    toast("setup.py is preparing the model in the background — its log appears below");
+    if (r.already) { mgToast(`already installed as ${r.config}`, "ok"); await selectModel(r.config); return; }
+    mgToast("setup.py is preparing the model in the background — its log appears below");
     setTimeout(refreshStatus, 1500);
-  } catch (e) { toast(e.message, "error"); }
+  } catch (e) { mgToast(e.message, "error"); }
 }
 
 async function reloadModels(keep) {
   const d = await api("/api/models");
-  state.models = d.models;
-  const defaultName = keep && state.editor ? state.editor.summary.config : d.default;
+  mgState.models = d.models;
+  const defaultName = keep && mgState.editor ? mgState.editor.summary.config : d.default;
   renderModels(defaultName);
   renderModelSelect(defaultName);
-  if (keep && state.editor) $("model-sel").value = state.editor.summary.config;
+  if (keep && mgState.editor) $("model-sel").value = mgState.editor.summary.config;
   return defaultName;
 }
 
-async function boot() {
-  try { await refreshSystem(); } catch (e) { /* non-fatal */ }
+/* ---------------------------------------------------------------- boot */
+async function mgBoot() {
+  try { await mgRefreshSystem(); } catch (e) { /* non-fatal */ }
   try {
     const defaultName = await reloadModels();
     if (defaultName) await selectModel(defaultName);
-    else toast("No models installed yet — SETUP.bat first.", "error");
-  } catch (e) { toast(e.message, "error"); }
+    else mgToast("No models installed yet — SETUP.bat first.", "error");
+  } catch (e) { mgToast(e.message, "error"); }
   await refreshStatus();
-  setInterval(refreshStatus, POLL_MS);
-  setInterval(async () => { if (!state.busy) await reloadModels(true); }, POLL_MS * 8);
+  setInterval(refreshStatus, MG_POLL_MS);
+  setInterval(() => { if (!mgState.busy) reloadModels(true).catch(() => {}); }, MG_POLL_MS * 8);
+  showTab(location.hash.slice(1) || store.get("lasttab", "manager") || "manager");
 }
+mgBoot();
 
 /* ---------------------------------------------------------------- wire up */
 $("model-sel").addEventListener("change", (ev) => selectModel(ev.target.value));
@@ -530,5 +630,3 @@ $("browse-use").addEventListener("click", useBrowseFolder);
 $("browse-go").addEventListener("click", () => setBrowseDir($("browse-path").value.trim()));
 $("browse-path").addEventListener("keydown", (ev) => { if (ev.key === "Enter") setBrowseDir($("browse-path").value.trim()); });
 $("gguf-prepare").addEventListener("click", doPrepareGguf);
-
-boot();

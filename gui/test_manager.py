@@ -496,5 +496,186 @@ class CrossPlatformPaths(unittest.TestCase):
         self.assertTrue(any(x.endswith("sub") for x in b["dirs"]))
 
 
+class UnifiedGateway(unittest.TestCase):
+    """The unified-page plumbing: the Manager serves the shared Strata UI kit and proxies the Strata
+    server's endpoints on the SAME origin, staying alive (clean "offline") when Strata is down."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.td = tempfile.TemporaryDirectory()
+        cls.root = Path(cls.td.name)
+        (cls.root / "engine").mkdir()
+        (cls.root / "engine" / "strata.exe").write_bytes(b"")
+        cls.cfg = sample_cfg(exe=str(cls.root / "engine" / "strata.exe"), api_key="top-secret")
+        (cls.root / "strata-q2_0.json").write_text(json.dumps(cls.cfg, indent=1), encoding="utf-8")
+        # a fake Strata server: answers the real endpoints the gateway forwards
+        from http.server import BaseHTTPRequestHandler as BH
+        class FakeStrata(BH):
+            key = "top-secret"
+            def log_message(self, *a): pass
+            def _json(self, code, obj):
+                body = json.dumps(obj).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            def _authorized(self):
+                ok = self.headers.get("Authorization") == "Bearer " + self.key
+                if not ok:
+                    self._json(401, {"error": {"message": "missing or wrong API key"}})
+                return ok
+            def do_GET(self):
+                path = self.path.split("?")[0]
+                if path == "/metrics":
+                    if not self._authorized(): return
+                    self._json(200, {"live": {"state": "idle"}, "engine": {"model": "fake"}})
+                elif path == "/v1/models":
+                    if not self._authorized(): return
+                    self._json(200, {"object": "list", "data": [{"id": "fake", "object": "model"}]})
+                else:
+                    self._json(404, {"error": {"message": "nope"}})
+            def do_POST(self):
+                path = self.path.split("?")[0]
+                if path == "/v1/chat/completions":
+                    if not self._authorized(): return
+                    if not self.headers.get("Content-Type", "").startswith("application/json"):
+                        self._json(415, {"error": {"message": "send application/json"}}); return
+                    n = int(self.headers.get("Content-Length", 0))
+                    body = json.loads(self.rfile.read(n) or b"{}")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.end_headers()
+                    self.wfile.write(b"data: {" + json.dumps({"choices": [{"delta": {"content": "hello"}}]}).encode() + b"}\n\n")
+                    self.wfile.write(b"data: [DONE]\n\n")
+                else:
+                    self._json(404, {"error": {"message": "nope"}})
+        cls.fake = cls.cfg.get("port", 8080)
+        # bind the fake Strata on a free port and point the config port at it
+        import socket
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            cls.fake = s.getsockname()[1]
+        cls.cfg["port"] = cls.fake
+        (cls.root / "strata-q2_0.json").write_text(json.dumps(cls.cfg, indent=1), encoding="utf-8")
+        import socketserver
+        from http.server import ThreadingHTTPServer as _THS
+        class S(_THS):
+            daemon_threads = True
+        cls.up = S(("127.0.0.1", cls.fake), FakeStrata)
+        threading.Thread(target=cls.up.serve_forever, daemon=True).start()
+        cls.server = mgr.make_server(cls.root, 0)
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.base = f"http://127.0.0.1:{cls.server.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown(); cls.server.server_close()
+        cls.up.shutdown(); cls.up.server_close()
+        cls.td.cleanup()
+
+    def _get(self, path, key=None):
+        req = urllib.request.Request(self.base + path)
+        if key:
+            req.add_header("Authorization", "Bearer " + key)
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return r.status, r.read()
+
+    def test_unified_page_is_one_native_app(self):
+        status, html = self._get("/")
+        self.assertEqual(status, 200)
+        text = html.decode("utf-8")
+        for tab in ("tab-btn-manager", "tab-btn-chat", "tab-btn-monitor", "tab-btn-about",
+                    "view-manager", "view-chat", "view-monitor", "view-about"):
+            self.assertIn(tab, text)
+        # the shared UI kit is served from serve/web, the Chat/Monitor/About code verbatim
+        self.assertIn(b"serve/web/app.js", (self._get("/web/serve-app.js"))[1][:120])
+        self.assertIn(b"Manager", (self._get("/web/app.js"))[1][:120])
+        self.assertIn(b"--st-accent", (self._get("/web/tokens.css"))[1])
+        status, _ = self._get("/fonts/outfit-latin-wght.woff2")
+        self.assertEqual(status, 200)
+
+    def test_common_strata_endpoint_is_proxied_with_the_config_key(self):
+        status, body = self._get("/metrics")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["live"]["state"], "idle")
+        self.assertNotIn(b"missing or wrong API key", body)     # the config key was injected, no CORS
+        status, body = self._get("/v1/models")
+        self.assertEqual(status, 200)
+        self.assertIn(b'"object"', body)
+
+    def test_chat_stream_flows_through_the_gateway(self):
+        import urllib.request as ur
+        req = ur.Request(self.base + "/v1/chat/completions",
+                         data=json.dumps({"messages": [{"role": "user", "content": "hi"}]}).encode(),
+                         headers={"Content-Type": "application/json"})
+        with ur.urlopen(req, timeout=15) as r:
+            body = r.read().decode()
+        self.assertIn("hello", body)
+
+    def test_offline_answer_when_strata_is_down(self):
+        # a fresh Manager pointing at a port where nothing listens
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            busy = 14999
+            (root / "strata-q2_0.json").write_text(
+                json.dumps(sample_cfg(port=busy), indent=1), encoding="utf-8")
+            srv = mgr.make_server(root, 0)
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            base = f"http://127.0.0.1:{srv.server_address[1]}"
+            try:
+                import urllib.error
+                with self.assertRaises(urllib.error.HTTPError) as cm:
+                    urllib.request.urlopen(base + "/health", timeout=10)
+                self.assertEqual(cm.exception.code, 503)
+                err = json.loads(cm.exception.read())
+                self.assertTrue(err.get("offline"))
+                # and the Manager's own API still answers: the page lives on
+                with urllib.request.urlopen(base + "/api/status", timeout=10) as r:
+                    self.assertEqual(json.loads(r.read())["data"]["server"]["state"], "stopped")
+            finally:
+                srv.shutdown(); srv.server_close()
+
+    def test_externally_running_strata_is_detected(self):
+        # (the gateway test's fake strata IS external: no Manager-owned server record)
+        with urllib.request.urlopen(self.base + "/api/status", timeout=10) as r:
+            body = json.loads(r.read())["data"]["server"]
+        self.assertEqual(body["state"], "external")
+        self.assertEqual(body["port"], self.fake)
+        self.assertTrue(body.get("external"))
+
+    def test_start_refused_while_external_runs(self):
+        r = mgr.start_server("strata-q2_0.json", self.fake, self.root)
+        self.assertFalse(r["ok"])
+        self.assertIn("outside the Manager", r["error"])
+
+    def test_random_process_on_the_port_is_not_strata(self):
+        # port answers TCP but not /v1/models: not classified as external
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            import socket
+            from http.server import BaseHTTPRequestHandler as BH, HTTPServer
+            class Plain(BH):
+                def log_message(self, *a): pass
+                def do_GET(self):
+                    body = b"<html>not strata</html>"
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+            with socket.socket() as s:
+                s.bind(("127.0.0.1", 0))
+                p = s.getsockname()[1]
+            (root / "strata-q2_0.json").write_text(
+                json.dumps(sample_cfg(port=p), indent=1), encoding="utf-8")
+            srv = HTTPServer(("127.0.0.1", p), Plain)
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            try:
+                self.assertIsNone(mgr.launcher.external_strata(root))
+                self.assertEqual(mgr.launcher.server_status(root)["state"], "stopped")
+            finally:
+                srv.shutdown(); srv.server_close()
+
+
 if __name__ == "__main__":
     unittest.main()

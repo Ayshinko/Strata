@@ -17,7 +17,12 @@ manager's "Save" writes the SAME strata-*.json files that setup.py writes, edite
                             the same outcome as closing Strata's own console window.  Nothing is added to
                             serve/server.py; Strata's own port-lock check also prevents duplicate instances.
 
-The server binds http://127.0.0.1:<port>/ only (default port 8275).  No secrets leave this PC.
+The server binds http://127.0.0.1:<port>/ only (default port 8275).  It is the persistent control
+surface: it serves ONE unified Strata-style web app (Manager / Chat / Monitor / About) and, while the
+Strata server on 8080 is stopped or restarting, the page stays alive - Chat/Monitor/About show a clean
+offline state and return automatically when Strata answers again.  The Strata server's own endpoints
+(health, metrics, mcp, settings, v1/*, ...) are proxied through this same origin, so the unified page
+uses the existing serve/web/app.js untouched: no CORS, no iframe, no second URL.
 
     python gui/manager.py            (or double-click START-MANAGER.bat / run ./start-manager.sh)
 
@@ -26,6 +31,7 @@ Options: --port N, --root DIR (another Strata folder; mainly for tests), --no-br
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import re
@@ -53,6 +59,29 @@ KEEP_BACKUPS = 5
 TRAINED_CONTEXT = 262144                # the model's trained length (setup.py's rope "trained" default)
 # the contexts setup.py offers (its CONTEXTS), plus 16K - a valid --max-context setup accepts without rope
 PRESET_CONTEXTS = sorted(set([8192, 16384, 32768, 65536, 131072, 262144]) | set(setup.CONTEXTS))
+
+# the Strata server's own endpoints, proxied by this Manager so the unified web app (running on this
+# port) can keep using the exact same frontend code it uses on 8080 - same origin, no CORS, and the UI
+# stays alive when the Strata server itself is stopped (then these return a clean "offline" answer).
+STRATA_PROXY_PREFIXES = ("/health", "/metrics", "/mcp", "/settings", "/props", "/slots", "/status",
+                         "/unload", "/load", "/models", "/v1/", "/api/health", "/api/requests")
+
+# web files the unified page loads: the shared Strata UI kit lives in serve/web, the Manager's own
+# unified page/styles/script in gui/web.  serve/web/app.js is served under web/serve-app.js so the
+# exactly-same Chat/Monitor/About code runs on this origin too without touching serve/web.
+WEB_TYPES = {".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8",
+             ".svg": "image/svg+xml", ".woff2": "font/woff2", ".html": "text/html; charset=utf-8",
+             ".json": "application/json", ".txt": "text/plain; charset=utf-8"}
+
+
+def _out(*args):
+    """print() that survives pythonw.exe (Windows: sys.stdout is None there - the Manager is launched
+    without a console by START-MANAGER.bat; its startup/errors go to logs/manager.log instead)."""
+    try:
+        if sys.stdout is not None:
+            print(*args)
+    except (AttributeError, TypeError, OSError):
+        pass
 
 # the supervisor (Start/Stop/Restart, the runtime state, the server's log) lives in gui/launcher.py and is
 # platform-neutral there - the OS-specific half is gui/platforms/
@@ -483,6 +512,61 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, json.JSONDecodeError):
             return {}
 
+    def _read_body(self) -> bytes:
+        """The raw request body (for proxy forwarding - the Chat API needs its JSON untouched)."""
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+            return self.rfile.read(n) if n else b""
+        except (OSError, ValueError):
+            return b""
+
+    def _proxy(self, method: str, path: str, body: bytes | None = None):
+        """Forward a browser call to the Strata server so the whole unified app lives on ONE origin (this
+        Manager's port) and keeps working while Strata itself is stopped.  The Manager is the trusted
+        local component: it sends the API key from the managed config (never the browser's), does not
+        forward the browser's Origin (so Strata's own-page guard sees a plain local client - no CORS
+        hacks anywhere), and answers with a clean "offline" error when Strata is down instead of raw
+        network errors.  Chat's SSE stream is passed through chunk by chunk."""
+        m = self.server.manager
+        port = m.strata_port()
+        headers = {}
+        ct = self.headers.get("Content-Type")
+        if ct and body:
+            headers["Content-Type"] = ct
+        if self.headers.get("Accept"):
+            headers["Accept"] = self.headers["Accept"]
+        key = m.api_key_for_port(port)
+        if key:
+            headers["Authorization"] = "Bearer " + key      # the config is the single source of truth
+        elif self.headers.get("Authorization"):
+            headers["Authorization"] = self.headers["Authorization"]
+        try:
+            resp = m.forward(port, method, path, body, headers)
+        except Exception as e:
+            self._send(503, json.dumps({"error": {"message": f"Strata is not running on port {port}."},
+                                                  "offline": True, "port": port}).encode("utf-8"),
+                       "application/json")
+            return
+        self.send_response(resp.status)
+        self.send_header("Content-Type", resp.getheader("Content-Type") or "application/json")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")             # close-delimited: streams as long as Strata does
+        self.end_headers()
+        try:
+            while True:
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass                                              # the browser went away - stop forwarding
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
     def _handle(self, fn):
         try:
             fn()
@@ -490,6 +574,18 @@ class Handler(BaseHTTPRequestHandler):
             import traceback
             traceback.print_exc()
             self._json({"ok": False, "error": f"{type(e).__name__}: {e}"}, 500)
+
+    def _send_web(self, path: str, name: str):
+        """Serve one of the unified page's static files: the Manager's own (gui/web) take precedence,
+        everything else comes from serve/web (the shared Strata UI kit, read-only).  name has already
+        been checked: no separators, known extension."""
+        m = self.server.manager
+        f = (m.web / name) if (m.web / name).is_file() else (m.shared_web / name)
+        if not f.is_file():
+            self._json({"ok": False, "error": "not found"}, 404)
+            return
+        ext = os.path.splitext(name)[1]
+        self._send(200, f.read_bytes(), WEB_TYPES.get(ext, "application/octet-stream"))
 
     # ---- routes ----------------------------------------------------------------------
     def do_GET(self):
@@ -500,10 +596,35 @@ class Handler(BaseHTTPRequestHandler):
         def route():
             if u.path in ("/", "/index.html"):
                 self._send(200, (m.web / "index.html").read_bytes(), "text/html; charset=utf-8")
-            elif u.path == "/app.css":
-                self._send(200, (m.web / "app.css").read_bytes(), "text/css; charset=utf-8")
-            elif u.path == "/app.js":
-                self._send(200, (m.web / "app.js").read_bytes(), "text/javascript; charset=utf-8")
+            elif u.path in ("/app.css", "/app.js"):                              # keep the old addresses
+                self._send_web(u.path, u.path[1:])
+            elif u.path.startswith("/fonts/"):
+                name = u.path[len("/fonts/"):]
+                if "/" in name or "\\" in name or not name.endswith(".woff2"):
+                    self._json({"ok": False, "error": "not found"}, 404)
+                    return
+                f = m.shared_web / "fonts" / name
+                if not f.is_file():
+                    self._json({"ok": False, "error": "not found"}, 404)
+                    return
+                self._send(200, f.read_bytes(), "font/woff2")
+            elif u.path.startswith("/web/"):
+                name = u.path[len("/web/"):]
+                ext = os.path.splitext(name)[1]
+                if "/" in name or "\\" in name or ext not in WEB_TYPES:
+                    self._json({"ok": False, "error": "not found"}, 404)
+                    return
+                if name in ("serve-app.js", "serve-app.css"):
+                    # the exactly-same serve/web/app.{js,css} under an alias: no copied, diverging files
+                    f = m.shared_web / ("app" + ext)
+                else:
+                    f = (m.web / name) if (m.web / name).is_file() else (m.shared_web / name)
+                if not f.is_file():
+                    self._json({"ok": False, "error": "not found"}, 404)
+                    return
+                self._send(200, f.read_bytes(), WEB_TYPES.get(ext, "application/octet-stream"))
+            elif u.path.startswith(STRATA_PROXY_PREFIXES):
+                self._proxy("GET", self.path)                 # the unified app's Chat/Monitor/About data
             elif u.path == "/api/system":
                 self._json({"ok": True, "data": system_info()})
             elif u.path == "/api/models":
@@ -527,40 +648,54 @@ class Handler(BaseHTTPRequestHandler):
                 n = min(int((q.get("tail") or ["200"])[0]), 1000)
                 self._json({"ok": True, "data": {"path": p, "text": tail_lines(p, n)}})
             elif u.path == "/api/open-chat":
-                webbrowser.open(f"http://127.0.0.1:{int((q.get('port') or ['8080'])[0])}/")
-                self._json({"ok": True})
+                # kept for older UIs; the unified page never leaves itself (its Chat is a native tab)
+                self._json({"ok": True, "hint": "the unified page has Chat built in"})
             else:
                 self._json({"ok": False, "error": f"unknown endpoint {u.path}"}, 404)
         self._handle(route)
 
     def do_POST(self):
         u = urllib.parse.urlparse(self.path)
-        body = self._read_json()
+        path = u.path.rstrip("/")
         m = self.server.manager
+        is_proxy = path.startswith(STRATA_PROXY_PREFIXES)
 
         def route():
-            if u.path == "/api/save":
+            if path == "/api/save":
                 cfg_path = m.resolve(body.get("config", ""))
                 if not cfg_path:
                     self._json({"ok": False, "error": "no such config"}, 404)
                     return
                 self._json(m.save(body, cfg_path))
-            elif u.path == "/api/start":
+            elif path == "/api/start":
                 self._json(m.start(body))
-            elif u.path == "/api/stop":
+            elif path == "/api/stop":
                 self._json(stop_server(m.root))
-            elif u.path == "/api/force-stop":
+            elif path == "/api/force-stop":
                 self._json(force_stop_server(m.root))
-            elif u.path == "/api/restart":
+            elif path == "/api/restart":
                 self._json(m.restart(body))
-            elif u.path == "/api/browse":
+            elif path == "/api/browse":
                 self._json({"ok": True, "data": m.browse(body.get("path", ""))})
-            elif u.path == "/api/gguf-detect":
+            elif path == "/api/gguf-detect":
                 self._json(detect_gguf_dir(body.get("path", "")))
-            elif u.path == "/api/prepare-gguf":
+            elif path == "/api/prepare-gguf":
                 self._json(m.prepare_gguf(body))
+            elif is_proxy:
+                self._proxy("POST", self.path, body_raw)      # Chat completions etc. - streamed through
             else:
                 self._json({"ok": False, "error": f"unknown endpoint {u.path}"}, 404)
+
+        if is_proxy:
+            # the proxy streams whatever Strata returns, so the request body stays raw bytes
+            body_raw = self._read_body()
+            try:
+                body = json.loads(body_raw) if body_raw else {}
+            except (ValueError, json.JSONDecodeError):
+                body = {}
+        else:
+            body_raw = b""
+            body = self._read_json()
         self._handle(route)
 
 
@@ -570,6 +705,8 @@ class Manager:
     def __init__(self, root: Path = ROOT):
         self.root = Path(root).resolve()
         self.web = Path(__file__).resolve().parent / "web"
+        self.shared_web = Path(__file__).resolve().parent.parent / "serve" / "web"
+        self._ext_cache = {"port": None, "at": 0.0}          # the detected external port, brief TTL
 
     @staticmethod
     def inside(base: str, path: str) -> bool:
@@ -585,6 +722,68 @@ class Manager:
         if p.parent != self.root or p.suffix != ".json" or not p.is_file():
             return None
         return p
+
+    # ---- the Strata gateway (the unified page's Chat / Monitor / About data) -------------------------------
+    def strata_port(self) -> int:
+        """The Strata port the gateway talks to: the server this Manager started (its remembered port), an
+        externally running Strata (same detection as the status check: port + real /v1/models), else the
+        conventional 8080.  The unified page depends on this: Chat / Monitor / About keep working against
+        whatever Strata is actually serving."""
+        st = launcher.ServerState(self.root).read()
+        srv = st.get("server") or {}
+        if srv.get("pid") and launcher.pid_alive(srv.get("pid")) and srv.get("port"):
+            return int(srv["port"])
+        ext = self.external_port()
+        return ext if ext else 8080
+
+    def external_port(self) -> int | None:
+        """The port of an externally started Strata (cached briefly: the 1 s Monitor poll must not probe
+        the port on every tick)."""
+        now = time.time()
+        cached = self._ext_cache.get("port")
+        if cached and now - self._ext_cache.get("at", 0.0) < 2.0:
+            return int(cached)
+        ext = launcher.external_strata(self.root)
+        port = int(ext["port"]) if ext else None
+        self._ext_cache = {"port": port, "at": now}
+        return port
+
+    def api_key_for_port(self, port: int) -> str:
+        """The managed API key for a Strata instance on `port` - the strata-*.json config (setup.py's
+        format) is the single source of truth; the browser's key is never consulted."""
+        for p in sorted(self.root.glob("strata-*.json")):
+            try:
+                cfg = read_config(p)
+                if cfg.get("port", 8080) == port:
+                    return cfg.get("api_key", "") or ""
+            except (OSError, ValueError):
+                continue
+        return ""
+
+    def forward(self, port: int, method: str, path: str, body: bytes | None,
+                headers: dict) -> http.client.HTTPResponse:
+        """One forwarded call to the Strata server on 127.0.0.1:port.  Connect with a short timeout, then
+        drop the read timeout: a chat generation can stream for minutes."""
+        conn = http.client.HTTPConnection("127.0.0.1", int(port), timeout=5)
+        try:
+            conn.connect()
+            conn.sock.settimeout(None)
+            conn.putrequest(method, path, skip_host=True, skip_accept_encoding=True)
+            conn.putheader("Host", f"127.0.0.1:{int(port)}")
+            for k, v in headers.items():
+                conn.putheader(k, v)
+            if body:
+                conn.putheader("Content-Length", str(len(body)))
+            conn.endheaders()
+            if body:
+                conn.send(body)
+            return conn.getresponse()
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            raise
 
     # ---- state for the editor -----------------------------------------------------------
     def config_state(self, cfg_path: Path) -> dict:
@@ -719,18 +918,23 @@ def main() -> int:
     a = ap.parse_args()
     root = Path(a.root).resolve()
     if not (root / "setup.py").is_file():
-        print(f"  [x] {root} is no Strata folder (no setup.py) - launch the Manager from inside Strata.")
+        _out(f"  [x] {root} is no Strata folder (no setup.py) - launch the Manager from inside Strata.")
         return 1
     try:
         httpd = make_server(root, a.port)
     except OSError as e:
-        print(f"  [x] the Manager's port {a.port} is taken ({e}). Use --port N for another one.")
+        _out(f"  [x] the Manager's port {a.port} is taken ({e}). Use --port N for another one.")
+        if not a.no_browser:                      # likely the Manager is already running: show its page
+            try:
+                webbrowser.open(f"http://127.0.0.1:{a.port}/#manager")
+            except Exception:
+                pass
         return 1
-    print("Strata Manager")
-    print(f"  managing        {root}")
-    print(f"  open            http://127.0.0.1:{a.port}/  (close this window or Ctrl+C to stop the Manager)")
+    _out("Strata Manager")
+    _out(f"  managing        {root}")
+    _out(f"  open            http://127.0.0.1:{a.port}/#manager  (no console: the browser page is the control center)")
     if not a.no_browser:
-        threading.Timer(0.4, lambda: webbrowser.open(f"http://127.0.0.1:{a.port}/")).start()
+        threading.Timer(0.4, lambda: webbrowser.open(f"http://127.0.0.1:{a.port}/#manager")).start()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

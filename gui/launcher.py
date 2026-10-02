@@ -93,14 +93,35 @@ def probe_port(host: str, port: int, timeout: float = PROBE_TIMEOUT) -> bool:
         return False
 
 
-def strata_ready(port: int, host: str = "127.0.0.1", timeout: float = PROBE_TIMEOUT) -> bool:
-    """The pick-you-up check a chat client would use: GET /v1/models answers with Strata's JSON."""
+def strata_ready(port: int, host: str = "127.0.0.1", timeout: float = PROBE_TIMEOUT,
+                 api_key: str = "") -> bool:
+    """The pick-you-up check a chat client would use: GET /v1/models answers with Strata's JSON (its
+    own key sent when the config has one - a key-protected server must still be recognised)."""
     import urllib.request
+    headers = {"Authorization": "Bearer " + api_key} if api_key else {}
     try:
-        with urllib.request.urlopen(f"http://{host}:{port}/v1/models", timeout=timeout) as r:
+        req = urllib.request.Request(f"http://{host}:{port}/v1/models", headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status == 200 and b'"object"' in r.read(65536)
     except (OSError, ValueError):
         return False
+
+
+def external_strata(root: Path = ROOT) -> dict | None:
+    """A Strata server this Manager did NOT start (START-HERE.bat / run-*.bat): one of the installed
+    configs' ports answers /v1/models with Strata's own JSON.  A random process on the port is NOT
+    accepted - only the real Strata endpoint counts, so the Manager never claims another server.
+    Returns {"port", "config"} of the first match (most recently used config first)."""
+    configs = sorted(root.glob("strata-*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for p in configs:
+        try:
+            cfg = read_config(p)
+            port = cfg.get("port", 8080)
+        except (OSError, ValueError):
+            continue
+        if probe_port("127.0.0.1", port) and strata_ready(port, api_key=cfg.get("api_key", "") or ""):
+            return {"port": port, "config": p.name}
+    return None
 
 
 def pid_alive(pid: int) -> bool:
@@ -114,7 +135,9 @@ def server_status(root: Path = ROOT) -> dict:
     current phase (graceful | forcing | starting | running) with the elapsed seconds, so the UI can show
     "Stopping… 4.2s" instead of guessing.  Otherwise the port is the ground truth (Strata answers it once the
     model is loaded); the remembered PID distinguishes "starting" from "stopped"; a server the Manager
-    started that is gone without a clean stop is an "error" (it crashed)."""
+    started that is gone without a clean stop is an "error" (it crashed).  A Strata the Manager did NOT
+    start (its port answers the real /v1/models endpoint) is "external": the Manager only supervises
+    what it started itself."""
     st = ServerState(root).read()
     srv = st.get("server") or {}
     lc = st.get("lifecycle") or {}
@@ -131,16 +154,30 @@ def server_status(root: Path = ROOT) -> dict:
                 "since": since, "elapsed": round(max(0.0, now - since), 1),
                 "config": name, "port": port, "log": srv.get("log")}
     if port and probe_port("127.0.0.1", port):
-        return {"state": "running", "port": port, "pid": pid, "config": name,
-                "ready": strata_ready(port), "log": srv.get("log")}
+        if pid_alive(pid):
+            return {"state": "running", "port": port, "pid": pid, "config": name,
+                    "ready": strata_ready(port), "log": srv.get("log")}
+        # our process is gone but the port still answers: an external instance (or an orphaned server
+        # from an earlier Manager run).  It is not ours to stop - report it as external.
+        return {"state": "external", "port": port, "config": name,
+                "ready": strata_ready(port), "log": srv.get("log"), "external": True}
     if pid_alive(pid):
         return {"state": "starting", "port": port, "pid": pid, "config": name, "ready": False,
                 "log": srv.get("log")}
     if srv.get("pid"):                                   # started then died on its own (crash, import error...)
+        # unless an external instance answered anyway (checked above on the recorded port) - else report the crash
+        ext = external_strata(root)
+        if ext:
+            return {"state": "external", "port": ext["port"], "config": ext.get("config"),
+                    "ready": True, "log": None, "external": True}
         return {"state": "error", "port": port, "config": name, "ready": False,
                 "log": srv.get("log"),
                 "error": "the server exited before answering (see its log)"}
-    return {"state": "stopped", "port": port, "config": name, "ready": False,
+    ext = external_strata(root)                           # no Manager-owned server: is Strata up anyway?
+    if ext:
+        return {"state": "external", "port": ext["port"], "config": ext.get("config"),
+                "ready": True, "log": None, "external": True}
+    return {"state": "stopped", "port": None, "config": None, "ready": False,
             "last_stop": st.get("last_stop")}
 
 
@@ -158,6 +195,10 @@ def start_server(name: str, port: int | None, root: Path = ROOT, open_chat: bool
     if status["state"] in ("running", "starting"):
         return {"ok": False, "state": status["state"],
                 "error": f"Strata is already {status['state']} (config {status.get('config')})."}
+    if status["state"] == "external":
+        return {"ok": False, "state": "external",
+                "error": "Strata is already running, started outside the Manager - close its console "
+                "first, the Manager never touches a process it did not start."}
     if probe_port("127.0.0.1", port):
         return {"ok": False, "error": f"something else is already listening on port {port}: another Strata "
                 "console, or another local server. Close it first - the Manager must not launch a second "
