@@ -8,13 +8,18 @@ rem (or a startup error) goes to logs\manager.log instead of a terminal.  Nothin
 rem Strata itself starts; START-HERE.bat stays the way to install/update the model.
 setlocal
 cd /d "%~dp0"
-if not exist ".venv\Scripts\pythonw.exe" (
-  echo  The environment .venv is missing - run START-HERE.bat once first (it installs the model too).
-  pause
-  exit /b 1
-)
+
+if not exist ".venv\Scripts\pythonw.exe" goto no_pythonw
+
 if not exist "logs" mkdir "logs"
-rem pythonw: no console, ever.  start: the cmd window itself goes away immediately (no persistent black
-rem terminal the user could close by accident and kill the Manager).  Output -> logs\manager.log.
-start "" /min ".venv\Scripts\pythonw.exe" gui\manager.py %* >> "logs\manager.log" 2>&1
+
+rem pythonw: no console, ever.  start: the cmd window itself goes away immediately (no persistent
+rem black terminal the user could close by accident and kill the Manager).  The Manager's output
+rem (or a startup error) goes to logs\manager.log - no terminal is ever needed.
+start "" ".venv\Scripts\pythonw.exe" gui\manager.py %*
 exit /b 0
+
+:no_pythonw
+echo The environment .venv is missing. Run START-HERE.bat once first.
+pause
+exit /b 1

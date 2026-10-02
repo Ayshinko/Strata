@@ -530,6 +530,9 @@ class UnifiedGateway(unittest.TestCase):
                 if path == "/metrics":
                     if not self._authorized(): return
                     self._json(200, {"live": {"state": "idle"}, "engine": {"model": "fake"}})
+                elif path in ("/api/health", "/health"):
+                    if not self._authorized(): return       # proves detection sends the config's key
+                    self._json(200, {"status": "ok", "model": "fake", "service": "strata"})
                 elif path == "/v1/models":
                     if not self._authorized(): return
                     self._json(200, {"object": "list", "data": [{"id": "fake", "object": "model"}]})
@@ -650,7 +653,7 @@ class UnifiedGateway(unittest.TestCase):
         self.assertIn("outside the Manager", r["error"])
 
     def test_random_process_on_the_port_is_not_strata(self):
-        # port answers TCP but not /v1/models: not classified as external
+        # port answers TCP but has no /api/health service=strata identity: not classified as external
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             import socket
@@ -675,6 +678,152 @@ class UnifiedGateway(unittest.TestCase):
                 self.assertEqual(mgr.launcher.server_status(root)["state"], "stopped")
             finally:
                 srv.shutdown(); srv.server_close()
+
+    def test_openai_compatible_server_without_strata_identity_is_not_detected(self):
+        # LM Studio / llama.cpp style: /v1/models with object+data, but no /api/health service=strata
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            import urllib.request as ur
+            from http.server import BaseHTTPRequestHandler as BH, HTTPServer
+            class OpenAiCompatible(BH):
+                def log_message(self, *a): pass
+                def _json(self, code, obj):
+                    body = json.dumps(obj).encode()
+                    self.send_response(code)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                def do_GET(self):
+                    path = self.path.split("?")[0]
+                    if path == "/v1/models":
+                        self._json(200, {"object": "list",
+                                         "data": [{"id": "gpt-oss-120b", "object": "model"}]})
+                    elif path == "/api/health":
+                        self._json(404, {"error": {"message": "no such endpoint"}})
+                    else:
+                        self._json(404, {"error": {"message": "nope"}})
+            import socket
+            with socket.socket() as s:
+                s.bind(("127.0.0.1", 0))
+                p = s.getsockname()[1]
+            (root / "strata-q2_0.json").write_text(
+                json.dumps(sample_cfg(port=p), indent=1), encoding="utf-8")
+            srv = HTTPServer(("127.0.0.1", p), OpenAiCompatible)
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            try:
+                self.assertIsNone(mgr.launcher.external_strata(root))
+                self.assertEqual(mgr.launcher.server_status(root)["state"], "stopped")
+                # and /v1/models alone is fine for readiness, never for identity
+                self.assertTrue(mgr.launcher.strata_ready(p))
+                self.assertFalse(mgr.launcher.strata_health(p))
+            finally:
+                srv.shutdown(); srv.server_close()
+
+    def test_key_protected_strata_is_detected_with_the_configured_key(self):
+        # the class fake Strata demands the key even on /api/health: detection sends the config's key.
+        self.assertTrue(mgr.launcher.strata_health(self.fake, api_key="top-secret"))
+        self.assertFalse(mgr.launcher.strata_health(self.fake))            # wrong/no key -> not Strata
+        self.assertFalse(mgr.launcher.strata_health(self.fake, api_key="wrong"))
+        ext = mgr.launcher.external_strata(self.root)
+        self.assertIsNotNone(ext)
+        self.assertEqual(ext["port"], self.fake)
+        self.assertTrue(ext.get("ready"))
+
+    def test_manager_owned_server_takes_precedence(self):
+        # the class fake is RUNNING and matches external_strata, but a live Manager-owned record wins
+        mgr.launcher.ServerState(self.root).write({"server": {"pid": 4242,
+                                                            "config": "strata-q2_0.json",
+                                                            "port": self.fake,
+                                                            "log": "x.serve.log"}, "tool": None})
+        try:
+            with mock.patch.object(mgr.launcher, "pid_alive", return_value=True):
+                st = mgr.launcher.server_status(self.root)
+            self.assertEqual(st["state"], "running")
+            self.assertNotIn("external", st)
+        finally:
+            mgr.launcher.ServerState(self.root).write({"server": None, "tool": None})
+
+    def test_external_disappears_back_to_stopped(self):
+        # a fresh external Strata is detected, then its disappearance flips the status to Stopped
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            import urllib.error
+            import urllib.request as ur
+            import socket
+            from http.server import BaseHTTPRequestHandler as BH, HTTPServer
+            class Ext(BH):
+                def log_message(self, *a): pass
+                def _json(self, code, obj):
+                    body = json.dumps(obj).encode()
+                    self.send_response(code)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                def do_GET(self):
+                    path = self.path.split("?")[0]
+                    if path == "/api/health":
+                        self._json(200, {"status": "ok", "service": "strata"})
+                    elif path == "/v1/models":
+                        self._json(200, {"object": "list", "data": []})
+                    else:
+                        self._json(404, {"error": {"message": "nope"}})
+            with socket.socket() as s:
+                s.bind(("127.0.0.1", 0))
+                p = s.getsockname()[1]
+            (root / "strata-q2_0.json").write_text(
+                json.dumps(sample_cfg(port=p), indent=1), encoding="utf-8")
+            srv = HTTPServer(("127.0.0.1", p), Ext)
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            mgr_srv = mgr.make_server(root, 0)
+            threading.Thread(target=mgr_srv.serve_forever, daemon=True).start()
+            base = f"http://127.0.0.1:{mgr_srv.server_address[1]}"
+            try:
+                with urllib.request.urlopen(base + "/api/status", timeout=10) as r:
+                    body = json.loads(r.read())["data"]["server"]
+                self.assertEqual(body["state"], "external")
+                srv.shutdown(); srv.server_close()
+                time.sleep(0.2)
+                with urllib.request.urlopen(base + "/api/status", timeout=10) as r:
+                    body = json.loads(r.read())["data"]["server"]
+                self.assertEqual(body["state"], "stopped")
+            finally:
+                mgr_srv.shutdown(); mgr_srv.server_close()
+                try:
+                    srv.server_close()
+                except Exception:
+                    pass
+
+
+class LauncherBat(unittest.TestCase):
+    """Structural checks for START-MANAGER.bat: cmd parses it safely (a parenthesized IF with a
+    closing parenthesis in its ECHO once produced the real ' . was unexpected at this time.' error)
+    and pythonw is launched without a redirect that would lock a file pythonw never writes to."""
+
+    def _bat(self) -> str:
+        p = Path(__file__).resolve().parents[1] / "START-MANAGER.bat"
+        return p.read_text(encoding="utf-8")
+
+    def test_no_parenthesized_if_with_paren_in_echo(self):
+        bat = self._bat()
+        self.assertNotIn('if not exist ".venv\\Scripts\\pythonw.exe" (', bat)  # the old hazard
+        self.assertNotIn(" (\r\n", bat)
+        self.assertNotIn("(\n", bat)
+        self.assertIn("goto no_pythonw", bat)          # goto style, not a block, per the fix
+        self.assertIn(":no_pythonw", bat)
+
+    def test_launches_pythonw_without_a_redirect_lock(self):
+        bat = self._bat()
+        self.assertIn("pythonw.exe", bat)              # no console window by design
+        self.assertIn('start "" ".venv\\Scripts\\pythonw.exe" gui\\manager.py %*', bat)
+        self.assertNotIn(">> \"logs\\manager.log\"", bat)   # the Manager writes its own log
+        self.assertNotIn('"logs\\manager.log" 2>&1', bat)
+
+    def test_exit_codes_are_explicit(self):
+        bat = self._bat()
+        self.assertIn("exit /b 0", bat)
+        self.assertIn("exit /b 1", bat)
 
 
 if __name__ == "__main__":

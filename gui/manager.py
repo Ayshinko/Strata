@@ -76,11 +76,20 @@ WEB_TYPES = {".css": "text/css; charset=utf-8", ".js": "text/javascript; charset
 
 def _out(*args):
     """print() that survives pythonw.exe (Windows: sys.stdout is None there - the Manager is launched
-    without a console by START-MANAGER.bat; its startup/errors go to logs/manager.log instead)."""
+    without a console by START-MANAGER.bat).  With no console around, the line goes to logs/manager.log
+    (same file the launcher redirects to) so a startup error is never invisible."""
     try:
         if sys.stdout is not None:
             print(*args)
-    except (AttributeError, TypeError, OSError):
+            return
+        log = Path(__file__).resolve().parent.parent / "logs" / "manager.log"
+        try:
+            log.parent.mkdir(parents=True, exist_ok=True)
+            with open(log, "a", encoding="utf-8") as f:
+                f.write(" ".join(str(a) for a in args) + "\n")
+        except OSError:
+            pass          # even the log is unwritable: stay silent rather than crash
+    except Exception:
         pass
 
 # the supervisor (Start/Stop/Restart, the runtime state, the server's log) lives in gui/launcher.py and is

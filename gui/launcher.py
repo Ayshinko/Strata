@@ -93,10 +93,35 @@ def probe_port(host: str, port: int, timeout: float = PROBE_TIMEOUT) -> bool:
         return False
 
 
+def strata_health(port: int, host: str = "127.0.0.1", timeout: float = PROBE_TIMEOUT,
+                  api_key: str = "") -> bool:
+    """Strata's own identity check: GET /api/health answers HTTP 200 with JSON service == "strata".
+    This is what makes a process on the port *Strata* and nothing else - LM Studio, llama.cpp or any
+    other OpenAI-compatible server answers /v1/models the same way but never claims service=strata.
+    The configured key is sent when the config has one, so a key-protected install is still
+    recognised."""
+    import json as _json
+    import urllib.request
+    headers = {"Authorization": "Bearer " + api_key} if api_key else {}
+    try:
+        req = urllib.request.Request(f"http://{host}:{port}/api/health", headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            if r.status != 200:
+                return False
+            try:
+                body = _json.loads(r.read(65536))
+            except ValueError:
+                return False
+            return body.get("service") == "strata"
+    except (OSError, ValueError):
+        return False
+
+
 def strata_ready(port: int, host: str = "127.0.0.1", timeout: float = PROBE_TIMEOUT,
                  api_key: str = "") -> bool:
-    """The pick-you-up check a chat client would use: GET /v1/models answers with Strata's JSON (its
-    own key sent when the config has one - a key-protected server must still be recognised)."""
+    """Readiness, not identity: an OpenAI-style GET /v1/models answers (Strata's own key sent when
+    the config has one).  Used for the status's `ready` field - deciding that something IS Strata is
+    strata_health()'s job, never this."""
     import urllib.request
     headers = {"Authorization": "Bearer " + api_key} if api_key else {}
     try:
@@ -107,11 +132,24 @@ def strata_ready(port: int, host: str = "127.0.0.1", timeout: float = PROBE_TIME
         return False
 
 
+def _config_for_port(root: Path, port: int) -> dict | None:
+    """The installed config that listens on `port` (most recently used first) - for its API key."""
+    configs = sorted(root.glob("strata-*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for p in configs:
+        try:
+            cfg = read_config(p)
+        except (OSError, ValueError):
+            continue
+        if cfg.get("port", 8080) == port:
+            return cfg
+    return None
+
+
 def external_strata(root: Path = ROOT) -> dict | None:
     """A Strata server this Manager did NOT start (START-HERE.bat / run-*.bat): one of the installed
-    configs' ports answers /v1/models with Strata's own JSON.  A random process on the port is NOT
-    accepted - only the real Strata endpoint counts, so the Manager never claims another server.
-    Returns {"port", "config"} of the first match (most recently used config first)."""
+    configs' ports answers /api/health with service == "strata" (the config's key sent when it has
+    one).  An arbitrary OpenAI-compatible server on the port (LM Studio, plain llama.cpp) is NOT
+    classified as Strata.  Returns {"port", "config", "ready"} of the first match."""
     configs = sorted(root.glob("strata-*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
     for p in configs:
         try:
@@ -119,8 +157,12 @@ def external_strata(root: Path = ROOT) -> dict | None:
             port = cfg.get("port", 8080)
         except (OSError, ValueError):
             continue
-        if probe_port("127.0.0.1", port) and strata_ready(port, api_key=cfg.get("api_key", "") or ""):
-            return {"port": port, "config": p.name}
+        if not probe_port("127.0.0.1", port):
+            continue
+        key = cfg.get("api_key", "") or ""
+        if not strata_health(port, api_key=key):
+            continue
+        return {"port": port, "config": p.name, "ready": strata_ready(port, api_key=key)}
     return None
 
 
@@ -136,8 +178,8 @@ def server_status(root: Path = ROOT) -> dict:
     "Stopping… 4.2s" instead of guessing.  Otherwise the port is the ground truth (Strata answers it once the
     model is loaded); the remembered PID distinguishes "starting" from "stopped"; a server the Manager
     started that is gone without a clean stop is an "error" (it crashed).  A Strata the Manager did NOT
-    start (its port answers the real /v1/models endpoint) is "external": the Manager only supervises
-    what it started itself."""
+    start (its port answers /api/health with service == "strata") is "external": the Manager only
+    supervises what it started itself - an arbitrary OpenAI-compatible server is never claimed."""
     st = ServerState(root).read()
     srv = st.get("server") or {}
     lc = st.get("lifecycle") or {}
@@ -154,13 +196,16 @@ def server_status(root: Path = ROOT) -> dict:
                 "since": since, "elapsed": round(max(0.0, now - since), 1),
                 "config": name, "port": port, "log": srv.get("log")}
     if port and probe_port("127.0.0.1", port):
+        key = (_config_for_port(root, port) or {}).get("api_key", "") or ""
         if pid_alive(pid):
             return {"state": "running", "port": port, "pid": pid, "config": name,
-                    "ready": strata_ready(port), "log": srv.get("log")}
-        # our process is gone but the port still answers: an external instance (or an orphaned server
-        # from an earlier Manager run).  It is not ours to stop - report it as external.
-        return {"state": "external", "port": port, "config": name,
-                "ready": strata_ready(port), "log": srv.get("log"), "external": True}
+                    "ready": strata_ready(port, api_key=key), "log": srv.get("log")}
+        # our process is gone but the port still answers.  Only claim it when its own health identity
+        # says it IS Strata (with the config's key); anything else falls through to the crash report.
+        if strata_health(port, api_key=key):
+            return {"state": "external", "port": port, "config": name,
+                    "ready": strata_ready(port, api_key=key), "log": srv.get("log"),
+                    "external": True}
     if pid_alive(pid):
         return {"state": "starting", "port": port, "pid": pid, "config": name, "ready": False,
                 "log": srv.get("log")}
