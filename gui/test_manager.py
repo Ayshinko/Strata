@@ -624,6 +624,9 @@ class UnifiedGateway(unittest.TestCase):
             (root / "strata-q2_0.json").write_text(
                 json.dumps(sample_cfg(port=busy), indent=1), encoding="utf-8")
             srv = mgr.make_server(root, 0)
+            # force the gateway target to the dead port: the fallback to the conventional 8080 would
+            # otherwise pick up a real Strata running on this machine and make "offline" non-deterministic
+            srv.manager.strata_port = lambda: busy
             threading.Thread(target=srv.serve_forever, daemon=True).start()
             base = f"http://127.0.0.1:{srv.server_address[1]}"
             try:
