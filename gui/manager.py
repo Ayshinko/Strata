@@ -428,7 +428,11 @@ def save_config(cfg_path: Path, cfg: dict, backup: bool = True) -> Path:
 
 
 # ====================================================================================================== custom GGUF
-GGUF_SHARD_RE = re.compile(r"(?i)(\d+)-of-(\d+)\.gguf$")
+# setup.py's own shard-name rule (SHARD_NAME: "-<5 digits>-of-<5 digits>.gguf", every shard of the
+# set) is the single source of truth for what a valid Strata GGUF shard set is; the Manager only
+# widens the letter case, like Windows filenames themselves, and requires a multi-shard set (the
+# published Strata files are always split).
+GGUF_SHARD_RE = re.compile(r"(?i)" + setup.SHARD_NAME.pattern)
 
 
 def _slug(text: str) -> str:
@@ -511,11 +515,19 @@ def detect_gguf_dir(path: str) -> dict:
         return {"ok": False,
                 "error": f"no multi-shard GGUF files (…-NNNN1-of-NNNN2.gguf) in {d}"}
     name = shards[0].name
+    # the size: setup.py's own GGUF_QUANT rule (the quant right before the shard suffix) first, then
+    # a boundary-safe scan of its MODELS keys for names that place the size elsewhere.  Longest
+    # MODELS key wins (IQ2_XS before IQ2…), and a size inside another token (IQ2_0, ud-q2-k) never
+    # matches Q2_0 - the same rules setup.py uses when it reads file names.
     q = None
-    for size in sorted(setup.MODELS, key=len, reverse=True):     # IQ2_XS before IQ2 etc.; longest match wins
-        if size in name:
-            q = size
-            break
+    m = setup.GGUF_QUANT.search(name)
+    if m and m.group(1).upper() in setup.MODELS:
+        q = m.group(1).upper()
+    if q is None:
+        for size in sorted(setup.MODELS, key=len, reverse=True):
+            if re.search(r"(?<![A-Za-z0-9]){}(?![A-Za-z0-9])".format(re.escape(size)), name):
+                q = size
+                break
     if q is None:
         example = setup.FAMILIES["qwen"]["file"].format(q="Q2_0", i=1)
         return {"ok": False, "error": f"cannot tell which Strata size {name} is. Strata knows these sizes: "
@@ -533,9 +545,9 @@ def detect_gguf_dir(path: str) -> dict:
     fam = setup.FAMILIES[family]
     variant = _variant_from_name(name, q, family, fam) or _variant_from_dir(d, q, family, fam)
     title = f"{fam['title']} {q}" + (f" {variant.replace('-', ' ').title()}" if variant else "")
-    return {"ok": True, "dir": str(d), "shards": [s.name for s in shards], "family": family,
-            "family_title": fam["title"], "quant": q, "tag": (fam["tag"] + q).lower(),
-            "variant": variant, "title": title}
+    return {"ok": True, "dir": str(d.resolve()), "shards": [s.name for s in shards],
+            "family": family, "family_title": fam["title"], "quant": q,
+            "tag": (fam["tag"] + q).lower(), "variant": variant, "title": title}
 
 
 # ====================================================================================================== system info

@@ -241,6 +241,58 @@ class GgufDetection(unittest.TestCase):
         d = self._dir("readme.txt")
         self.assertFalse(mgr.detect_gguf_dir(str(d))["ok"])
 
+    # the real report's pattern: the custom label (abliterated) sits BEFORE the size in the name,
+    # and the size is read by setup.py's own GGUF_QUANT rule - not by a lucky substring
+    def test_real_abliterated_pattern_uses_setup_quant_rule(self):
+        d = self._dir(ABLITERATED_1, ABLITERATED_2)
+        r = mgr.detect_gguf_dir(str(d))
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["quant"], "Q2_0")
+        self.assertEqual(r["variant"], "abliterated")
+        self.assertEqual(r["tag"], "q2_0")
+
+    def test_unsloth_ud_quant_from_setup_rule(self):
+        d = self._dir("Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
+                      "Qwen3.8-Flash-Next-UD-Q4_K_XL-00004-of-00004.gguf")
+        r = mgr.detect_gguf_dir(str(d))
+        self.assertEqual(r["quant"], "UD-Q4_K_XL")
+        self.assertEqual(r["family"], "unsloth")
+
+    def test_iq2_xs_is_not_q2_0(self):
+        d = self._dir("Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf",
+                      "Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf")
+        self.assertEqual(mgr.detect_gguf_dir(str(d))["quant"], "IQ2_XS")
+
+    def test_size_inside_another_token_is_not_a_match(self):
+        # IQ2_0 is not a Strata size and must never be read as Q2_0 (boundary-guarded scan)
+        d = self._dir("Qwen3.8-Flash-Next-GSQ-RCO-IQ2_0-00001-of-00002.gguf",
+                      "Qwen3.8-Flash-Next-GSQ-RCO-IQ2_0-00002-of-00002.gguf")
+        self.assertFalse(mgr.detect_gguf_dir(str(d))["ok"])
+
+    def test_size_elsewhere_in_the_name_still_detects(self):
+        # the size is not adjacent to the shard suffix: the MODELS scan still finds it (copy tag)
+        d = self._dir("Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-copy-00001-of-00002.gguf",
+                      "Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-copy-00002-of-00002.gguf")
+        r = mgr.detect_gguf_dir(str(d))
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["quant"], "Q2_0")
+        self.assertEqual(r["variant"], "copy")
+
+    def test_pasted_file_path_detects_its_folder(self):
+        d = self._dir(SHARD1, SHARD2)
+        r = mgr.detect_gguf_dir(str(d / SHARD1))          # the full .gguf path, as pasted
+        self.assertTrue(r["ok"])
+        self.assertEqual(Path(r["dir"]).resolve(), d.resolve())
+
+    def test_dir_is_canonical_resolved(self):
+        # trailing slash / forward slashes: the same folder, the same canonical dir (identity)
+        d = self._dir(SHARD1, SHARD2)
+        a = mgr.detect_gguf_dir(str(d) + "/")
+        b = mgr.detect_gguf_dir(str(d).replace("\\", "/"))
+        self.assertTrue(a["ok"] and b["ok"])
+        self.assertEqual(a["dir"], b["dir"])
+        self.assertEqual(Path(a["dir"]).resolve(), d.resolve())
+
 
 ABLITERATED_1 = "Qwen3.8-Flash-Next-GSQ-RCO-abliterated-Q2_0-00001-of-00002.gguf"
 ABLITERATED_2 = "Qwen3.8-Flash-Next-GSQ-RCO-abliterated-Q2_0-00002-of-00002.gguf"
@@ -1236,6 +1288,23 @@ class SetupVariant(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertFalse((self.t / "strata-q2_0.json").exists())
         self.assertFalse((self.t / "strata-q2_0-not").exists())
+
+
+class FrontendStateContract(unittest.TestCase):
+    """The Custom GGUF field's state machine (gui/web/gguf_state.js): the pure JS behind "the
+    field is the source of truth" - a stale detection is invalidated on change, a late async
+    response is ignored, Prepare refuses a detection whose directory is not exactly the field,
+    and Browse reaches the same state as manual input.  Runs the node tests when node is
+    installed; a machine without node skips (the suite stays stdlib-only)."""
+
+    NODE_TEST = ROOT / "gui" / "web" / "test_gguf_state.mjs"
+
+    def test_gguf_field_state_machine(self):
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is not installed")
+        r = subprocess.run([node, str(self.NODE_TEST)], capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, f"gui/web/test_gguf_state.mjs failed:\n{r.stdout}\n{r.stderr}")
 
 
 if __name__ == "__main__":

@@ -21,7 +21,7 @@
 /* ---------------------------------------------------------------- lifecycle bookkeeping */
 const MG_POLL_MS = 2000;
 const mgState = { models: [], editor: null, status: { server: { state: "unknown" } }, tool: null,
-                  busy: false, ggufDetect: null };
+                  busy: false };
 // the running operation (Stop / Force Stop / Restart): shown immediately on click, updated by polling.
 const mgOp = { state: null, phase: null, since: 0, ticker: null };
 let mgOnline = false;                        // is Strata's server answering? (running or external)
@@ -321,7 +321,10 @@ function fillEditor() {
   $("vision-hint").textContent = e.vision_available ? "" : "Vision not installed for this model — run SETUP.bat --vision to add it (the Manager never downloads).";
   for (const r of document.querySelectorAll('input[name="vision"]')) r.disabled = !e.vision_available;
   const firstGguf = s.gguf && s.gguf[0];
-  if (firstGguf && !$("gguf-path").value) $("gguf-path").value = firstGguf.replace(new RegExp("/?[^/\\\\]+$"), "");
+  if (firstGguf && !$("gguf-path").value) {
+    $("gguf-path").value = firstGguf.replace(new RegExp("/?[^/\\\\]+$"), "");
+    ggufPathChanged();   // the field is the source of truth: detect what it was just filled with
+  }
 }
 
 function fillGpu(e) {
@@ -582,15 +585,94 @@ function handleTool() {
   }
 }
 
-/* ---------------------------------------------------------------- browse + custom GGUF */
+/* ---------------------------------------------------------------- browse + custom GGUF
+   The Custom GGUF text field is the SOURCE OF TRUTH.  The only path that is detected is the
+   field's value, and a detection is only ever usable (and Prepare only enabled) when it was
+   made for exactly the path the field shows now:
+     - changing the field (typed, pasted, autofilled, Browse's "Use this folder") invalidates
+       the previous detection immediately and hides Prepare
+     - every detection carries the generation token it was started under; a response that
+       arrives after the field changed again (or for an older path) is ignored
+     - Prepare refuses to run with any detection whose directory does not exactly match the
+       field (ggufDet.prepareAllowed) - visible path A + internal detection B cannot happen
+   Browse is only a picker with a preview: "Use this folder" writes the chosen path into the
+   field and the SAME detect-on-change path runs, so there is no second, hidden state to go
+   stale.  The field's note (gguf-note) always describes the detection of the CURRENT value. */
+const ggufDet = new GgufState.GgufDetection();
 let mgBrowsePath = "";
-async function openBrowse(startPath) {
-  const d = await api("/api/browse", { method: "POST", headers: { "Content-Type": "application/json" },
-                                       body: JSON.stringify({ path: startPath || mgBrowsePath }) });
-  mgBrowsePath = d.path;
-  $("browse-path").value = d.path;
-  $("browse-modal").hidden = false;
-  renderDirs(d);
+let mgBrowseToken = 0;
+let mgGgufPathTimer = null;
+
+function setGgufNote(text, ok) {
+  const n = $("gguf-note");
+  if (!n) return;
+  n.textContent = text || "";
+  n.dataset.ok = ok || "";
+}
+
+function setGgufPrepareEnabled(on) {
+  const b = $("gguf-prepare");
+  if (!b) return;
+  b.hidden = !on;
+  b.disabled = false;
+  b.textContent = "Prepare with Strata";
+}
+
+function paintGgufDetect(det) {
+  // Paint the COMMITTED detection for the current field value (ggufDet.detect).
+  if (!det || det.ok === false) {
+    setGgufNote(det && det.error ? det.error : "", det && det.ok === false ? "0" : "");
+    setGgufPrepareEnabled(false);
+    return;
+  }
+  const shown = (det.variant ? det.variant.replace(/-/g, " ").replace(/\b\w/g, c => c.toUpperCase()) : "");
+  const what = [det.family_title, det.quant, shown].filter(Boolean).join(" ");
+  setGgufNote(`✓ ${det.title || what} — ${det.shards.length} shards`
+    + (det.variant ? ` · custom build “${det.variant}”` : ""), "1");
+  setGgufPrepareEnabled(true);
+  $("gguf-prepare").title = det.variant
+    ? `prepares strata-${det.tag}-${det.variant}.json`
+    : `prepares strata-${det.tag}.json (an existing config pointing at these same files is reused)`;
+}
+
+// The field changed (typed / pasted / autofilled / "Use this folder"): the old detection dies
+// NOW, Prepare disappears, and the current value is (re)detected - always the same code path.
+function ggufPathChanged() {
+  clearTimeout(mgGgufPathTimer);
+  const token = ggufDet.invalidate();            // stale detection is gone immediately
+  const path = $("gguf-path").value.trim();
+  if (!path) { setGgufNote(""); setGgufPrepareEnabled(false); return; }
+  setGgufNote("detecting …", "");
+  setGgufPrepareEnabled(false);
+  mgGgufPathTimer = setTimeout(() => detectGgufPath(token, path), 200);   // debounce keystrokes
+}
+
+async function detectGgufPath(token, path) {
+  let det;
+  try {
+    det = await api("/api/gguf-detect", { method: "POST", headers: { "Content-Type": "application/json" },
+                                           body: JSON.stringify({ path }) });
+  } catch (e) {
+    if (ggufDet.token === token && GgufState.pathsEqual($("gguf-path").value, path))
+      setGgufNote("✗ " + e.message, "0");
+    return;
+  }
+  // accept() refuses the response unless it is the current generation AND (on success) its
+  // directory is exactly the path the field shows now - the late/stale responses never land.
+  if (!ggufDet.accept($("gguf-path").value, det, token)) return;
+  paintGgufDetect(ggufDet.detect);
+}
+
+function openBrowse(startPath) {
+  api("/api/browse", { method: "POST", headers: { "Content-Type": "application/json" },
+                       body: JSON.stringify({ path: startPath || mgBrowsePath }) })
+    .then(d => {
+      mgBrowsePath = d.path;
+      $("browse-path").value = d.path;
+      $("browse-modal").hidden = false;
+      renderDirs(d);
+    })
+    .catch(e => mgToast(e.message, "error"));
 }
 
 function renderDirs(d) {
@@ -615,46 +697,65 @@ function renderDirs(d) {
   browsePreview(d.path);
 }
 
-async function setBrowseDir(path) {
-  const d = await api("/api/browse", { method: "POST", headers: { "Content-Type": "application/json" },
-                                       body: JSON.stringify({ path }) });
-  mgBrowsePath = d.path;
-  $("browse-path").value = d.path;
-  renderDirs(d);
+function setBrowseDir(path) {
+  api("/api/browse", { method: "POST", headers: { "Content-Type": "application/json" },
+                       body: JSON.stringify({ path }) })
+    .then(d => {
+      mgBrowsePath = d.path;
+      $("browse-path").value = d.path;
+      renderDirs(d);
+    })
+    .catch(e => mgToast(e.message, "error"));
 }
 
+// The picker's own preview panel only - it never touches the committed detection.  "Use this
+// folder" is the only thing that writes into the field, and that runs ggufPathChanged() like
+// any other change.  A late preview response (the user clicked another folder meanwhile) is
+// ignored by the preview's own generation token.
 async function browsePreview(path) {
   mgBrowsePath = path;
+  const token = ++mgBrowseToken;
   const dd = $("browse-detect");
+  dd.textContent = "detecting …";
+  dd.dataset.ok = "0";
+  let det;
   try {
-    const det = await api("/api/gguf-detect", { method: "POST", headers: { "Content-Type": "application/json" },
-                                                body: JSON.stringify({ path }) });
-    if (det.ok) {
-      dd.textContent = `✓ ${det.title || det.family_title + " " + det.quant} — shards: ${det.shards.join(", ")}`
-        + (det.variant ? ` · custom build “${det.variant}”` : "");
-      dd.title = (det.variant ? `prepares strata-${det.tag}-${det.variant}.json`
-        : `prepares strata-${det.tag}.json (an existing config pointing at these same files is reused)`);
-      dd.dataset.ok = "1";
-      $("gguf-prepare").hidden = !det.tag;
-      mgState.ggufDetect = det;
-    } else {
-      dd.textContent = det.error;
-      dd.dataset.ok = "0";
-      $("gguf-prepare").hidden = true;
-      mgState.ggufDetect = null;
-    }
-  } catch (e) { dd.textContent = e.message; }
+    det = await api("/api/gguf-detect", { method: "POST", headers: { "Content-Type": "application/json" },
+                                           body: JSON.stringify({ path }) });
+  } catch (e) {
+    if (token === mgBrowseToken) dd.textContent = e.message;
+    return;
+  }
+  if (token !== mgBrowseToken) return;                       // a later preview superseded this one
+  if (det.ok) {
+    dd.textContent = `✓ ${det.title || det.family_title + " " + det.quant} — shards: ${det.shards.join(", ")}`
+      + (det.variant ? ` · custom build “${det.variant}”` : "");
+    dd.title = det.variant ? `prepares strata-${det.tag}-${det.variant}.json`
+      : `prepares strata-${det.tag}.json (an existing config pointing at these same files is reused)`;
+    dd.dataset.ok = "1";
+  } else {
+    dd.textContent = det.error;
+    dd.dataset.ok = "0";
+  }
 }
 
 function useBrowseFolder() {
   $("browse-modal").hidden = true;
-  $("gguf-path").value = mgBrowsePath;
-  browsePreview(mgBrowsePath);
+  $("gguf-path").value = mgBrowsePath;       // write the choice into the field, then the usual change
+  ggufPathChanged();
 }
 
 async function doPrepareGguf() {
-  const det = mgState.ggufDetect;
-  if (!det) return;
+  const path = $("gguf-path").value.trim();
+  // The field is the source of truth: never prepare a detection whose directory is not exactly
+  // the path the field shows now.  If they disagree (or nothing was detected), re-detect and
+  // refuse instead of running the stale path.
+  if (!ggufDet.prepareAllowed(path)) {
+    mgToast("detect this exact folder first — the path in the field is what gets prepared", "error");
+    ggufPathChanged();
+    return;
+  }
+  const det = ggufDet.detect;
   const btn = $("gguf-prepare");
   setUpPrepareButton(true);
   try {
@@ -715,6 +816,8 @@ $("stop").addEventListener("click", doStop);
 $("force-stop").addEventListener("click", doForceStop);
 $("restart").addEventListener("click", doRestart);
 $("gguf-browse").addEventListener("click", () => openBrowse($("gguf-path").value || ""));
+$("gguf-path").addEventListener("input", ggufPathChanged);        // typed / pasted: detect on change
+$("gguf-path").addEventListener("change", ggufPathChanged);       // plus the committed (blur) value
 $("browse-close").addEventListener("click", () => { $("browse-modal").hidden = true; });
 $("browse-use").addEventListener("click", useBrowseFolder);
 $("browse-go").addEventListener("click", () => setBrowseDir($("browse-path").value.trim()));

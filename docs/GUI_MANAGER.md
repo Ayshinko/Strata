@@ -148,6 +148,8 @@ All of these are gitignored machine data.
 - Supervisor (Start/Stop/Restart, state, log tail): `gui/launcher.py`
 - OS adapters (the only platform code): `gui/platforms/windows.py`, `gui/platforms/linux.py`
 - Frontend (no dependencies): `gui/web/index.html`, `gui/web/app.css`, `gui/web/app.js`
+- Custom-GGUF field state (the field is the source of truth; no DOM): `gui/web/gguf_state.js`,
+  tested with `node gui/web/test_gguf_state.mjs` (the unittest suite runs it when node is present)
 - Launchers: `START-MANAGER.bat` (Windows), `start-manager.sh` (Linux)
 - Tests: `python -m unittest gui.test_manager` (temp folders and a real local HTTP round-trip; no GPU,
   no network, no user files are touched).  The supervisor is tested against a fake platform adapter, so the
