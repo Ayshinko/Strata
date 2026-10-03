@@ -559,7 +559,8 @@ def system_info() -> dict:
         used = None
         try:
             out = subprocess.run(["nvidia-smi", "--query-gpu=index,memory.used", "--format=csv,noheader,nounits"],
-                                 capture_output=True, text=True, timeout=10).stdout
+                                 capture_output=True, text=True, timeout=10,
+                                 creationflags=setup.child_flags()).stdout
             for line in out.splitlines():
                 i, _, v = line.partition(",")
                 if i.strip() == str(g["index"]):

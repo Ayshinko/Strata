@@ -12,6 +12,10 @@ a windowless detached server cannot answer, so after a short grace the tree is f
 result says so - the UI then shows it took the forced path).
 
 No PowerShell, no .bat: only CreateProcess + taskkill.
+
+Every short utility subprocess this module starts (taskkill) runs with CREATE_NO_WINDOW: launched from a
+pythonw/no-console parent (the Manager), a console-subsystem child would otherwise flash a transient black
+window; from a console parent the flag changes nothing (its output still goes where the caller redirected it).
 """
 
 from __future__ import annotations
@@ -44,16 +48,19 @@ class WindowsLauncher(Launcher):
 
     def terminate(self, pid: int, grace_s: float) -> dict:
         subprocess.run(["taskkill", "/PID", str(pid), "/T"], capture_output=True,
+                       creationflags=subprocess.CREATE_NO_WINDOW,
                        timeout=max(1, int(grace_s) + 1))
         if self._wait_dead(pid, min(grace_s, _SOFT_GRACE_S)):
             return {"stopped": True, "forced": False}
         subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True,
+                       creationflags=subprocess.CREATE_NO_WINDOW,
                        timeout=max(1, int(grace_s) + 1))
         self._wait_dead(pid, 8.0)
         return {"stopped": not self.alive(pid), "forced": True}
 
     def terminate_force(self, pid: int) -> dict:
-        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, timeout=30)
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, timeout=30,
+                       creationflags=subprocess.CREATE_NO_WINDOW)
         self._wait_dead(pid, 8.0)
         return {"stopped": not self.alive(pid), "forced": True}
 

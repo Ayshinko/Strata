@@ -58,6 +58,23 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 WIN = os.name == "nt"
+
+
+def child_flags() -> int:
+    """Windows subprocess creation flags for the SHORT utility commands setup itself runs (nvidia-smi,
+    powershell, the python tools): subprocess.CREATE_NO_WINDOW when this process has NO console - a
+    pythonw/GUI context (the Manager imports setup.py) where a console child would otherwise flash a
+    transient black window.  An interactive terminal run keeps its console behavior exactly (no flag), and
+    a child the Manager itself spawned keeps the hidden console it was given (it HAS a console).  0 on
+    Linux."""
+    if not WIN:
+        return 0
+    try:
+        if ctypes.windll.kernel32.GetConsoleWindow():
+            return 0                    # a real (or hidden) console to inherit: normal behavior
+        return getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    except Exception:
+        return 0
 # #214: every Hugging Face file comes from a fixed commit of its repository (the `sha` of
 # https://huggingface.co/api/models/<repo> when this was pinned), so a checkout installs the same files on any
 # day.  A revision the repository no longer has falls back to its current files, with a message (download()).
@@ -229,7 +246,7 @@ def run(cmd, cwd=None, env=None, check=True, quiet=False):
     say("  > " + " ".join(str(c) for c in cmd))
     r = subprocess.run([str(c) for c in cmd], cwd=cwd, env=env,
                        stdout=subprocess.PIPE if quiet else None, stderr=subprocess.STDOUT if quiet else None,
-                       text=True)
+                       text=True, creationflags=child_flags())
     if check and r.returncode != 0:
         if quiet and r.stdout:
             say(r.stdout[-4000:])
@@ -239,7 +256,8 @@ def run(cmd, cwd=None, env=None, check=True, quiet=False):
 
 def out(cmd):
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=60).stdout
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=60,
+                              creationflags=child_flags()).stdout
     except (OSError, subprocess.TimeoutExpired):
         return ""
 
@@ -1271,7 +1289,7 @@ def hip_devices(probe: Path | None = None, text: str | None = None) -> list[dict
             env = dict(os.environ)                     # the ready-made engine's ROCm DLLs (rocm/bin beside it)
             env["PATH"] = os.pathsep.join([str(d) for d in hip_lib_dirs(probe.parent)] + [env.get("PATH", "")])
             r = subprocess.run([str(probe), "--list-devices"], capture_output=True, text=True, timeout=120,
-                               cwd=str(probe.parent), env=env)
+                               creationflags=child_flags(), cwd=str(probe.parent), env=env)
         except (OSError, subprocess.TimeoutExpired):
             return None
         if r.returncode != 0:
@@ -2286,6 +2304,18 @@ def write_config(path: Path, cfg: dict):
     os.replace(tmp, path)
 
 
+def api_identity(fam: dict, model: str, variant: str | None) -> tuple:
+    """(model_name, aliases) a config should advertise: the name /v1/models and /v1/status report, and the alias
+    list to keep so old clients still work.  The published model keeps only its own name (qwen3.8-flash-next-q2_0);
+    a --variant build is its OWN API model (qwen3.8-flash-next-q2_0-abliterated) with the canonical name kept as
+    an alias - clients that send the published id are still answered, while the APIs truthfully say what is
+    loaded."""
+    canonical = f"{fam['name']}-{model.lower()}"
+    if not variant:
+        return canonical, None
+    return f"{canonical}-{variant}", [canonical]
+
+
 def readable_config(path: Path) -> bool:
     """#459: a config that parses as a JSON object; any other gets a one-line warning naming it."""
     text = None
@@ -2596,7 +2626,7 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
         # so there the server is PID 1 and docker stop's SIGTERM reaches the process that can
         # answer the engine with QUIT. Normal Linux starts keep spawning the server as a child.
         os.execv(cmd[0], cmd)
-    return subprocess.call(cmd)
+    return subprocess.call(cmd, creationflags=child_flags())
 
 
 # the draft subsets setup copied before (sha256): replaced by the current one, a subset made by hand is kept
@@ -2614,6 +2644,17 @@ def saved_draft_vocab(cfg_path: Path) -> str | None:
     except (OSError, ValueError, AttributeError):
         return None
     return v if v in DRAFT_VOCABS else None
+
+
+def saved_aliases(cfg_path: Path) -> list[str] | None:
+    """The aliases a config already carries (setup's own default for a --variant build, or ones edited by hand), or
+    None.  A setup run again never overwrites aliases the owner edited: only the defaults it would write itself are
+    replaced."""
+    try:
+        a = json.loads(cfg_path.read_text(encoding="utf-8-sig")).get("aliases")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return a if isinstance(a, list) and all(isinstance(x, str) for x in a) else None
 
 
 DRAFT_VOCAB_MIB = {"cjk": 348, "cyrillic": 193, "en": 133}   # the draft head's VRAM per subset (IQ3_S: the largest)
@@ -2642,7 +2683,7 @@ def mtp_corrupt(mtp: Path, env=None) -> bool:
     if not (mtp / "tensors").is_dir():
         return False
     r = subprocess.run([sys.executable, str(ROOT / "tools" / "mtp_fetch.py"), "verify", "--out", str(mtp)], env=env,
-                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, creationflags=child_flags())
     return r.returncode == 3
 
 
@@ -2781,7 +2822,9 @@ def main() -> int:
     ap.add_argument("--variant", metavar="LABEL",
                     help="a label for your OWN GGUF build (e.g. --variant abliterated), so several builds of the "
                          "same size can coexist: the config, its pack and the logs are named "
-                         "strata-<size>-<label> instead of strata-<size>. Letters, digits, '-' and '_' only.  "
+                         "strata-<size>-<label> instead of strata-<size>, and the API model name gains the label "
+                         "too (qwen3.8-flash-next-q2_0-abliterated), with the canonical name kept as an alias for "
+                         "clients that still send it. Letters, digits, '-' and '_' only.  "
                          "The published files never need it; Strata's Manager passes it for custom GGUFs.")
     ap.add_argument("--yes", action="store_true", help="accept the recommended answers")
     ap.add_argument("--setup", action="store_true", help="install another model or change settings")
@@ -3420,9 +3463,12 @@ def main() -> int:
         # the package's profile, with llama.cpp's flags (the engine takes the same ones)
         args += ["--control-vector-scaled", f"{esp}:1.0", "--control-vector-layer-range", "4", "44",
                  "--cvec-mode", "project", "--cvec-dir", "per-layer"]
+    model_name, aliases = api_identity(fam, model, variant)   # a --variant build is its own API model
     cfg = {"exe": str(eng / EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
-           "model_name": f"{fam['name']}-{model.lower()}", "log": str(ROOT / f"strata-{tag.lower()}.log"),
+           "model_name": model_name, "log": str(ROOT / f"strata-{tag.lower()}.log"),
            "lib_dirs": lib_dirs, "port": port}
+    if aliases:
+        cfg["aliases"] = list(aliases)        # the canonical name kept: clients sending it are still answered
     if hip:
         cfg["backend"] = "hip"
         # the dense prompt GEMMs through hipBLASLt with kernels measured on this GPU generation (tools/hip; +40-60%
@@ -3452,6 +3498,9 @@ def main() -> int:
         if vision == "cpu":
             cfg["vision"]["threads"] = max(1, (os.cpu_count() or 8) // 2)
     cfg_path = ROOT / f"strata-{tag.lower()}.json"
+    keep = saved_aliases(cfg_path)
+    if keep is not None and keep != aliases:
+        cfg["aliases"] = keep                 # aliases edited by hand are never overwritten
     cal = None if hip else saved_calibration(cfg)     # tools/calibrate.py is NVIDIA-only for now
     if cal is not None:
         sys.path.insert(0, str(ROOT / "tools"))

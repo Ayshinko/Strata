@@ -824,6 +824,74 @@ class LauncherTest(unittest.TestCase):
         self.assertEqual(LinuxLauncher.name, "linux")
 
 
+class NoWindowPolicy(unittest.TestCase):
+    """The Manager runs under pythonw (no console): every short utility subprocess it starts (nvidia-smi,
+    taskkill) must pass no-window creation flags, or Windows shows a transient black console window."""
+
+    def test_system_info_hides_console_windows(self):
+        """The Manager's own nvidia-smi call carries setup's no-window policy (CREATE_NO_WINDOW from a
+        console-less parent, 0 from a console): it can never flash a black window under pythonw."""
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append((cmd, kw))
+            return type("R", (), {"stdout": ""})()
+
+        with mock.patch.object(mgr.subprocess, "run", side_effect=fake_run), \
+                mock.patch.object(setup, "gpus", return_value=[FAKE_GPU]), \
+                mock.patch.object(setup, "cpu_info", return_value=("Fake CPU 1", True, True)):
+            mgr.system_info()
+        self.assertTrue(calls)
+        cmd, kw = calls[0]
+        self.assertEqual(cmd[0], "nvidia-smi")
+        expected = setup.child_flags()          # CREATE_NO_WINDOW here (pythonw/no console), 0 in a terminal
+        self.assertEqual(kw.get("creationflags", 0), expected)
+
+    def test_windows_taskkill_never_flashes_a_console(self):
+        if os.name != "nt":
+            self.skipTest("Windows launcher behavior checked on Windows")
+        import subprocess as _sp
+        from gui.platforms.windows import WindowsLauncher
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append((cmd, kw))
+            return type("R", (), {"stdout": ""})()
+
+        with mock.patch("gui.platforms.windows.subprocess.run", side_effect=fake_run), \
+                mock.patch.object(WindowsLauncher, "_wait_dead", return_value=True), \
+                mock.patch.object(WindowsLauncher, "alive", return_value=False):
+            WindowsLauncher().terminate(4242, 5.0)
+            WindowsLauncher().terminate_force(4242)
+        self.assertTrue(calls)
+        for _cmd, kw in calls:
+            self.assertTrue(kw["creationflags"] & _sp.CREATE_NO_WINDOW)
+
+    def test_windows_engine_spawn_keeps_its_hidden_console(self):
+        """The long-lived server/engine keeps the intentional hidden inherited console: the no-window policy
+        is for the SHORT utilities, this spawn must still give the engine a (hidden) console to inherit."""
+        if os.name != "nt":
+            self.skipTest("Windows launcher behavior checked on Windows")
+        import subprocess as _sp
+        from gui.platforms.windows import WindowsLauncher
+        calls = {}
+
+        def fake_popen(*a, **kw):
+            calls.update(kw)
+            return type("P", (), {"pid": 1234})()
+
+        fd, path = tempfile.mkstemp()
+        os.close(fd)
+        log = Path(path)
+        self.addCleanup(lambda: log.unlink(missing_ok=True))
+        with mock.patch("gui.platforms.windows.subprocess.Popen", side_effect=fake_popen):
+            WindowsLauncher().spawn(["python", "-m", "x"], str(Path(".").resolve()), log)
+        flags = calls["creationflags"]
+        self.assertTrue(flags & _sp.CREATE_NEW_CONSOLE)          # a real console to inherit
+        self.assertFalse(flags & _sp.CREATE_NO_WINDOW)           # ...not a console-less engine
+        self.assertEqual(calls["startupinfo"].wShowWindow, 0)   # SW_HIDE: born invisible
+
+
 class CrossPlatformPaths(unittest.TestCase):
     """The Manager's path handling must not assume drive letters or backslashes (Linux: /mnt/Storage/Model)."""
 
