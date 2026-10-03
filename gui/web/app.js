@@ -256,6 +256,7 @@ function renderModels(defaultName) {
     cur.hidden = !(defaultName && m.config === defaultName);
     const meta = [];
     meta.push(`family ${m.family || "?"}`);
+    if (m.variant) meta.push(`variant ${m.variant}`);
     meta.push(`context ${m.context ? m.context.toLocaleString() : "?"}`);
     if (m.kv) meta.push(`KV ${m.kv}`);
     meta.push(`vision ${m.vision || "off"}`);
@@ -504,13 +505,81 @@ async function handleLog() {
   } catch (e) { /* transient */ }
 }
 
+/* the running setup.py preparation (custom GGUF): its own state + a settle-once transition so a finished
+   run (also one that failed in seconds, before the first poll) shows its outcome and never just flashes. */
+let mgPrepare = null;                       // { config, title, alive, settled }
+let mgPrepareLogAt = 0;
+
+function mgPrepareResetCard(clear) {
+  const card = $("prepare-card");
+  if (card) card.hidden = true;
+  if (clear) mgPrepare = null;
+}
+
+async function pollPrepareLog(path, force) {
+  const now = Date.now();
+  if (!force && now < mgPrepareLogAt) return;
+  mgPrepareLogAt = now + 1500;
+  try {
+    const d = await api("/api/log?path=" + encodeURIComponent(path) + "&tail=200");
+    const box = $("prepare-log");
+    box.textContent = d.text || "(no output yet — setup.py is starting)";
+    box.scrollTop = box.scrollHeight;
+  } catch (e) { /* transient */ }
+}
+
+function setUpPrepareButton(btn) {
+  $("gguf-prepare").disabled = !!btn;
+  $("gguf-prepare").textContent = btn ? "Preparing…" : "Prepare with Strata";
+}
+
 function handleTool() {
   const t = mgState.tool;
-  if (!t) { $("gguf-note").textContent = ""; return; }
-  const alive = t.alive;
+  if (!t) {
+    mgPrepareResetCard(true);
+    setUpPrepareButton(false);
+    return;
+  }
+  const alive = !!t.alive;
+  if (!mgPrepare || mgPrepare.config !== t.config) {
+    mgPrepare = { config: t.config, title: t.title || "", alive: null, settled: false };
+  }
   const el = Math.round((Date.now() / 1000) - (t.started || 0));
-  $("gguf-note").textContent = (alive ? "⏳ " : "✓ ") + t.what + (alive ? ` (${el}s — log: ${t.log})` : " finished — refresh the list");
-  if (!alive) setTimeout(reloadModels, 1500);
+  const spin = $("prepare-card").querySelector(".spinner");
+  if (alive) {
+    mgPrepare.alive = true;
+    mgPrepare.settled = false;                      // another run started: watch it again
+    setUpPrepareButton(true);
+    $("prepare-card").hidden = false;
+    if (spin) spin.style.visibility = "visible";
+    $("prepare-text").textContent =
+      `${t.what || mgPrepare.title || t.config} — running (${el}s) · log: ${t.log}`;
+    pollPrepareLog(t.log);
+  } else if (!mgPrepare.settled) {
+    // finished: either just now (alive->dead) or already gone before the first poll (fast fail)
+    mgPrepare.settled = true;
+    mgPrepare.alive = false;
+    setUpPrepareButton(false);
+    $("prepare-card").hidden = false;
+    if (spin) spin.style.visibility = "hidden";
+    const settleToken = mgPrepare.config;
+    const failed = t.failed || !t.ready;
+    if (failed) {
+      $("prepare-text").textContent =
+        `✗ ${mgPrepare.title || mgPrepare.config} FAILED — setup.py's log (${t.log}) is shown below`;
+      mgToast(`✗ ${mgPrepare.title || "preparation"} failed — see the log`, "error");
+    } else {
+      $("prepare-text").textContent = `✓ ${mgPrepare.title} installed as ${mgPrepare.config}`;
+      mgToast(`✓ ${mgPrepare.title} installed as ${mgPrepare.config}`, "ok");
+      reloadModels().then(() => selectModel(mgPrepare.config));   // refresh + select the NEW config
+    }
+    pollPrepareLog(t.log, true);
+    setTimeout(() => { if (mgPrepare && mgPrepare.settled && mgPrepare.config === settleToken) {
+      mgPrepareResetCard(true);
+    } }, 15000);
+  } else {
+    setUpPrepareButton(false);
+  }
 }
 
 /* ---------------------------------------------------------------- browse + custom GGUF */
@@ -561,7 +630,10 @@ async function browsePreview(path) {
     const det = await api("/api/gguf-detect", { method: "POST", headers: { "Content-Type": "application/json" },
                                                 body: JSON.stringify({ path }) });
     if (det.ok) {
-      dd.textContent = `✓ ${det.family_title} ${det.quant} — shards: ${det.shards.join(", ")}`;
+      dd.textContent = `✓ ${det.title || det.family_title + " " + det.quant} — shards: ${det.shards.join(", ")}`
+        + (det.variant ? ` · custom build “${det.variant}”` : "");
+      dd.title = (det.variant ? `prepares strata-${det.tag}-${det.variant}.json`
+        : `prepares strata-${det.tag}.json (an existing config pointing at these same files is reused)`);
       dd.dataset.ok = "1";
       $("gguf-prepare").hidden = !det.tag;
       mgState.ggufDetect = det;
@@ -583,12 +655,30 @@ function useBrowseFolder() {
 async function doPrepareGguf() {
   const det = mgState.ggufDetect;
   if (!det) return;
+  const btn = $("gguf-prepare");
+  setUpPrepareButton(true);
   try {
     const r = await post("/api/prepare-gguf", { path: det.dir, context: parseInt($("ctx-num").value, 10) || 32768 });
-    if (r.already) { mgToast(`already installed as ${r.config}`, "ok"); await selectModel(r.config); return; }
-    mgToast("setup.py is preparing the model in the background — its log appears below");
-    setTimeout(refreshStatus, 1500);
-  } catch (e) { mgToast(e.message, "error"); }
+    if (r.already) {
+      // the exact same GGUF files are already a config: select it, nothing runs
+      setUpPrepareButton(false);
+      mgToast(`already installed as ${r.config}${r.title ? " — " + r.title : ""}`, "ok");
+      await reloadModels();
+      await selectModel(r.config);
+      return;
+    }
+    // setup.py runs detached; /api/status polls its log and settles the result (success or failure)
+    $("prepare-card").hidden = false;
+    $("prepare-text").textContent =
+      `⏳ ${r.title || det.title} is being prepared as ${r.config} — setup.py runs below`;
+    mgPrepare = { config: r.config, title: r.title || det.title || "", alive: null, settled: false };
+    setTimeout(refreshStatus, 400);
+  } catch (e) {
+    setUpPrepareButton(false);
+    $("prepare-card").hidden = false;
+    $("prepare-text").textContent = `✗ ${e.message}`;
+    mgToast(e.message, "error");
+  }
 }
 
 async function reloadModels(keep) {

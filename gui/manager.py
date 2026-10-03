@@ -188,11 +188,19 @@ def model_summary(cfg_path: Path) -> dict:
     ch = setup.choices_from_config(cfg_path)
     args = cfg.get("args", [])
     ctx = ch["context"]
+    variant = ch.get("variant")
+    stem = cfg_path.stem[len("strata-"):]
+    title = cfg.get("model_name") or stem
+    if variant:                             # a custom build: its readable name, not the canonical model_name
+        ft = (setup.FAMILIES.get(ch["family"], {}) or {}).get("title") or ch["family"]
+        shown = variant.replace("-", " ").title()
+        title = f"{ft} {ch['model']} {shown}" if ch["model"] else f"{ft} {shown}"
     return {
         "config": cfg_path.name,
-        "title": cfg.get("model_name") or cfg_path.stem[len("strata-"):],
+        "title": title,
         "family": ch["family"],
         "quant": ch["model"],                                # setup's MODELS key (Q2_0, IQ3_XXS, ...)
+        "variant": variant,                                   # the custom-build label, None for the published files
         "quant_about": setup.MODELS.get(ch["model"], {}).get("about"),
         "gguf": gguf_paths(cfg),
         "pack": arg_val(args, "--pack"),
@@ -423,10 +431,75 @@ def save_config(cfg_path: Path, cfg: dict, backup: bool = True) -> Path:
 GGUF_SHARD_RE = re.compile(r"(?i)(\d+)-of-(\d+)\.gguf$")
 
 
+def _slug(text: str) -> str:
+    """Lowercase, drop everything that is not a letter/digit, keep '-' as the separator: a config file name
+    part that is safe on every filesystem and readable ("system focus ab", not an emoji)."""
+    return re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", text.lower())).strip("-")
+
+
+def _strip_published(name: str, quant: str, family: str, fam: dict) -> str:
+    """The name with the pieces every Strata file carries removed: the family's markers (Qwen3.8-Flash-Next,
+    GSQ-RCO, swift/coder/unsloth), the size (Q2_0, IQ3_XXS, ...) and the shard suffix.  What is left is the
+    custom build's own label; "" when the file is named exactly like the published one."""
+    low = re.sub(r"-\d+-of-\d+\.gguf$", "", name, flags=re.I).lower()
+    markers = [m for m in sorted({family, (fam.get("tag") or "").strip("-"), (fam.get("name") or ""),
+                                  (fam.get("title") or ""), "qwen3.8-flash-next", "flash-next", "gsq-rco",
+                                  "qwen", "model", "gguf"}, key=len, reverse=True) if m]
+    for m in markers:
+        if m in low:
+            low = low.replace(m, "-")
+    # the size as it appears in names (Q2_0, UD-Q4_K_XL) and its joined forms (q20, udq4kxl, q2.0)
+    for form in {quant.lower(), quant.lower().replace("_", ""), quant.lower().replace("_", ".")}:
+        low = re.sub(rf"(?<![a-z0-9]){re.escape(form)}(?![a-z0-9])", "-", low)
+    return _slug(low)
+
+
+def _variant_from_name(name: str, quant: str, family: str, fam: dict) -> str | None:
+    """What a GGUF file name says this build is, once the published pieces are removed; None when nothing
+    custom is left (the name is exactly a published one)."""
+    return _strip_published(name, quant, family, fam) or None
+
+
+def _variant_from_dir(d: Path, quant: str, family: str, fam: dict) -> str | None:
+    """The same from the folder's own name (Q2_0-Abliterated -> "abliterated"); None when it says nothing
+    beyond the size."""
+    return _strip_published(d.name, quant, family, fam) or None
+
+
+def _short_hash(paths: list) -> str:
+    """A short, deterministic id of a set of GGUF files - the collision guard for the very rare case where
+    two different builds share even their readable name."""
+    import hashlib
+    return hashlib.sha256("|".join(sorted(paths)).encode("utf-8")).hexdigest()[:8]
+
+
+def _same_shards(a: list, b: list) -> bool:
+    """Two configs reference the same model files when their --native/--ple-gguf shards resolve identically."""
+    try:
+        return sorted(str(Path(p).resolve()) for p in a) == sorted(str(Path(p).resolve()) for p in b)
+    except OSError:
+        return False
+
+
+def _shard_paths(det: dict) -> list:
+    """The chosen GGUF files as absolute paths, in setup.py's order (the shard-number order)."""
+    d = Path(det["dir"])
+    return [str((d / s).resolve()) for s in det["shards"]]
+
+
+def _tool_failed(tail: str) -> bool:
+    """setup.py's own failure banner: a stopped run says "Setup stopped." and marks the failing step with
+    [X]; a finished run ends with "All set."."""
+    t = tail.lower()
+    return "setup stopped." in t or "[x]" in t
+
+
 def detect_gguf_dir(path: str) -> dict:
     """What Strata would make of a chosen folder with GGUF files: the family and size from the file names
     (setup.py's own naming conventions: Qwen3.8-Flash-Next-GSQ-RCO-<Q> or Swift-.../<Q> or Coder-.../<Q>,
-    shards "...-0000i-of-00002.gguf").  Preparation itself is left to setup.py (prepare_gguf)."""
+    shards "...-0000i-of-00002.gguf"), plus the custom-build label, if any, that makes it a different model
+    from the published files of the same size (--variant).  Preparation itself is left to setup.py
+    (prepare_gguf)."""
     d = Path(path)
     if d.is_file():
         d = d.parent
@@ -458,8 +531,11 @@ def detect_gguf_dir(path: str) -> dict:
     else:
         family = fams[0]
     fam = setup.FAMILIES[family]
+    variant = _variant_from_name(name, q, family, fam) or _variant_from_dir(d, q, family, fam)
+    title = f"{fam['title']} {q}" + (f" {variant.replace('-', ' ').title()}" if variant else "")
     return {"ok": True, "dir": str(d), "shards": [s.name for s in shards], "family": family,
-            "family_title": fam["title"], "quant": q, "tag": (fam["tag"] + q).lower()}
+            "family_title": fam["title"], "quant": q, "tag": (fam["tag"] + q).lower(),
+            "variant": variant, "title": title}
 
 
 # ====================================================================================================== system info
@@ -866,8 +942,16 @@ class Manager:
     def status_payload(self) -> dict:
         st = launcher.ServerState(self.root).read()
         tool = st.get("tool") or {}
-        return {"server": server_status(self.root),
-                "tool": {**tool, "alive": launcher.pid_alive(tool.get("pid"))} if tool else None}
+        if tool:
+            tool = {**tool, "alive": launcher.pid_alive(tool.get("pid"))}
+            if not tool["alive"]:      # a finished (or failed) setup: say which, from setup.py's own log
+                tail = tail_lines(tool.get("log", ""), 60)
+                tool["failed"] = _tool_failed(tail)
+                cfg = tool.get("config") or ""
+                tool["ready"] = bool(cfg) and (self.root / cfg).is_file()
+        else:
+            tool = None
+        return {"server": server_status(self.root), "tool": tool}
 
     def start(self, body: dict) -> dict:
         return start_server(body.get("config", ""), body.get("port"), self.root, body.get("open_chat", False))
@@ -893,21 +977,82 @@ class Manager:
     def prepare_gguf(self, body: dict) -> dict:
         """A chosen custom GGUF folder becomes an installed model through the EXISTING setup.py pipeline
         (--gguf-dir, --no-start, --yes): no second packing/downloading system lives here.  setup.py's own
-        output streams to a log the UI tails, and the new config lands in the Strata folder for the editor."""
+        output streams to a log the UI tails, and the new config lands in the Strata folder for the editor.
+
+        Identity: a config is "already installed" ONLY when it already references these exact GGUF files
+        (their resolved --native/--ple-gguf paths).  A different build of the same family+size - a custom
+        GGUF - gets its own uniquely named config (strata-<size>-<variant>.json, prepared with setup.py's
+        --variant, so its pack is rebuilt from its own files): the original strata-<size>.json is never
+        overwritten."""
         det = detect_gguf_dir(body.get("path", ""))
         if not det["ok"]:
             return det
         fam = setup.FAMILIES[det["family"]]
-        cfg_name = f"strata-{det['tag']}.json"
-        if (self.root / cfg_name).exists():
-            return {"ok": True, "already": cfg_name, "config": cfg_name}
+        want = _shard_paths(det)
+        # 1) an existing config that already references these exact GGUF files -> already installed
+        for cp in sorted(self.root.glob("strata-*.json")):
+            try:
+                have = gguf_paths(read_config(cp))
+            except (OSError, ValueError):
+                have = []
+            if have and _same_shards(have, want):
+                summary = model_summary(cp)
+                return {"ok": True, "already": cp.name, "config": cp.name, "title": summary["title"]}
+        # 2) the published files, and the canonical config is free: setup.py's plain path (unchanged)
+        canonical = f"strata-{det['tag']}.json"
+        if det.get("variant") is None and not (self.root / canonical).exists():
+            return self._run_prepare(det, "", body)
+        # 3) a custom build: give it its own deterministic, filesystem-safe identity.  (The files look
+        #    published, but the canonical slot is another build's - the folder name decides, else a hash.)
+        variant = det.get("variant")
+        if variant is None:
+            variant = _variant_from_dir(Path(det["dir"]), det["quant"], det["family"], fam) or _short_hash(want)
+        variant = self._variant_slug(det["tag"], variant, want)
+        return self._run_prepare(det, variant, body)
+
+    def _variant_slug(self, tag: str, variant: str, want: list) -> str:
+        """The --variant label setup.py receives (and therefore the config it writes): the readable one when
+        it is free, else a short hash of the chosen files appended - a config that is already another
+        build's is never reused or overwritten.  setup.py always names the config exactly from this label
+        (strata-<tag>-<label>.json), so the hash lives IN the label, not in a separate filename."""
+        def taken(name: str) -> bool:
+            p = self.root / name
+            if not p.is_file():
+                return False
+            try:
+                return not _same_shards(gguf_paths(read_config(p)), want)
+            except (OSError, ValueError):
+                return True
+        if not taken(f"strata-{tag}-{variant}.json"):
+            return variant
+        h = _short_hash(want)
+        for n in range(1, 50):
+            cand = f"{variant}-{h}{'-' + str(n) if n > 1 else ''}"
+            if not taken(f"strata-{tag}-{cand}.json"):
+                return cand
+        return f"{variant}-{h}"                          # practically unreachable; never block the prepare
+
+    def _run_prepare(self, det: dict, variant: str, body: dict) -> dict:
+        """The actual preparation through setup.py (--gguf-dir --no-start --yes, plus --variant for a
+        custom build), detached and streaming into logs/manager-prepare-<name>.log for the UI to tail.
+        setup.py names the config exactly from the variant label (strata-<tag>-<variant>.json), so the
+        returned config name is the one that lands in the Strata folder."""
+        fam = setup.FAMILIES[det["family"]]
         ctx = int(body.get("context") or 32768)
         cmd = [sys.executable, str(self.root / "setup.py"), "--family", det["family"], "--model", det["quant"],
                "--gguf-dir", det["dir"], "--context", str(ctx), "--no-start", "--yes"]
-        log_path = self.root / "logs" / f"manager-prepare-{det['tag']}.log"
-        tool = run_tool(cmd, log_path, f"preparing {fam['title']} {det['quant']} from {det['dir']}",
-                        root=self.root)
-        return {"ok": True, "config": cfg_name, "tool": tool, "log": str(log_path)}
+        if variant:
+            cfg_name = f"strata-{det['tag']}-{variant}.json"   # setup.py names the config exactly from --variant
+            cmd += ["--variant", variant]
+        else:
+            cfg_name = f"strata-{det['tag']}.json"             # the canonical published name, unchanged
+        # the log mirrors the config: manager-prepare-q2_0-abliterated.log for strata-q2_0-abliterated.json
+        log_path = self.root / "logs" / f"manager-prepare-{cfg_name[len('strata-'):-5]}.log"
+        tool = run_tool(cmd, log_path, f"preparing {det['title']} from {det['dir']}", root=self.root)
+        st = launcher.ServerState(self.root).read()
+        st["tool"] = {**(st.get("tool") or {}), "config": cfg_name, "title": det["title"]}
+        launcher.ServerState(self.root).write(st)
+        return {"ok": True, "config": cfg_name, "title": det["title"], "tool": st["tool"], "log": str(log_path)}
 
 
 def make_server(root: Path, port: int, host: str = "127.0.0.1") -> ThreadingHTTPServer:

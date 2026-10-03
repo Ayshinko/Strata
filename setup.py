@@ -2313,20 +2313,36 @@ def previous_config(elsewhere_first: list, settings: dict):
     return next((c for c in sorted(cands, key=lambda p: p.stat().st_mtime, reverse=True) if readable_config(c)), None)
 
 
+def split_size_variant(tag: str, family: str) -> tuple:
+    """(size, variant) from a config stem's tail: q2_0 -> (Q2_0, None); q2_0-abliterated -> (Q2_0,
+    "abliterated").  The longest known size wins (UD-Q4_K_XL keeps its dash, IQ3_XXS before IQ3_XS) and a
+    variant is everything after the first '-'.  (None, None) when the stem is not a known size."""
+    rest = tag[len(FAMILIES[family]["tag"]):] if tag.startswith(FAMILIES[family]["tag"]) else tag
+    for q in sorted(MODELS, key=len, reverse=True):
+        low = q.lower()
+        if rest == low:
+            return q, None
+        if rest.startswith(low + "-"):
+            return q, rest[len(low) + 1:]
+    return None, None
+
+
 def choices_from_config(cfg_path: Path) -> dict:
-    """The setup answers a config was written with (family, size, context, KV, images, projection, network)."""
+    """The setup answers a config was written with (family, size, variant, context, KV, images, projection,
+    network).  `variant` is the custom-build label of a strata-<size>-<variant>.json config (None for the
+    published files), read from the file name - the config file itself is the identity."""
     cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
     tag = cfg_path.stem[len("strata-"):]
     family = next((f for f, d in FAMILIES.items() if d["tag"] and tag.startswith(d["tag"])), "qwen")
-    model = (tag[len(FAMILIES[family]["tag"]):] if tag.startswith(FAMILIES[family]["tag"]) else tag).upper()
-    if model not in MODELS:                            # (sizes have no dash except UD-Q4_K_XL: the old rule)
+    model, variant = split_size_variant(tag, family)
+    if model is None:                                  # (sizes have no dash except UD-Q4_K_XL: the old rule)
         model = tag.split("-")[-1].upper()
     a = cfg.get("args", [])
     val = lambda k: a[a.index(k) + 1] if k in a and a.index(k) + 1 < len(a) else None   # noqa: E731
     vis = cfg.get("vision")
     esp = val("--control-vector-scaled")
     esp_path = esp.rsplit(":", 1)[0] if esp else None
-    return {"family": family, "model": model if model in MODELS else None,
+    return {"family": family, "model": model if model in MODELS else None, "variant": variant,
             "context": int(val("--max-context")) if val("--max-context") else None,
             "kv": val("--kv") if val("--kv") in ("int8", "q4_0") else None,
             "vision": ("gpu" if vis.get("gpu") else "cpu") if isinstance(vis, dict) else "none",
@@ -2762,6 +2778,11 @@ def main() -> int:
     ap.add_argument("--models-dir", help="where the GGUF files go (default: <data folder>/models)")
     ap.add_argument("--gguf-dir", help="use GGUF files you already have (a folder with every shard: "
                                        "<name>-00001-of-0000N.gguf ... -0000N-of-0000N.gguf)")
+    ap.add_argument("--variant", metavar="LABEL",
+                    help="a label for your OWN GGUF build (e.g. --variant abliterated), so several builds of the "
+                         "same size can coexist: the config, its pack and the logs are named "
+                         "strata-<size>-<label> instead of strata-<size>. Letters, digits, '-' and '_' only.  "
+                         "The published files never need it; Strata's Manager passes it for custom GGUFs.")
     ap.add_argument("--yes", action="store_true", help="accept the recommended answers")
     ap.add_argument("--setup", action="store_true", help="install another model or change settings")
     ap.add_argument("--no-start", action="store_true", help="install only, do not start the model")
@@ -3058,7 +3079,11 @@ def main() -> int:
     if not low_ram and budget is None and ram < MODELS[model]["ram_gb"] - 4:
         confirm_paging(model, ram, a.low_ram, a.yes, bool(a.model))
     ok(f"size: {model}")
-    tag = fam["tag"] + model                           # names of the pack, config and start script
+    variant = (a.variant or "").strip().lower()
+    if a.variant and not re.fullmatch(r"[a-z0-9_-]+", variant):
+        fail("--variant takes letters, digits, '-' and '_' only (no spaces): it names the config file as "
+             f"strata-{fam['tag']}{model.lower()}-<variant>.json")
+    tag = fam["tag"] + model + (("-" + variant) if variant else "")   # names of the pack, config, start script
     small = min(x["vram_gb"] for x in chosen)         # each card keeps its layers' KV of the whole context
     rec_ctx = 32768 if small < 14 else 65536 if small < 20 else 131072
     if budget is not None:                             # UD-Q4_K_XL: every GB of KV is a GB fewer of cached experts

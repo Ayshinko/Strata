@@ -13,6 +13,7 @@ Pure stdlib + unittest; no GPU, no network, no downloads.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -21,6 +22,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 import urllib.request
 from pathlib import Path
@@ -238,6 +240,302 @@ class GgufDetection(unittest.TestCase):
     def test_no_shards(self):
         d = self._dir("readme.txt")
         self.assertFalse(mgr.detect_gguf_dir(str(d))["ok"])
+
+
+ABLITERATED_1 = "Qwen3.8-Flash-Next-GSQ-RCO-abliterated-Q2_0-00001-of-00002.gguf"
+ABLITERATED_2 = "Qwen3.8-Flash-Next-GSQ-RCO-abliterated-Q2_0-00002-of-00002.gguf"
+
+
+def mk_shard_dir(parent: Path, name: str, *shard_names) -> Path:
+    """A folder with the shards (empty bytes are enough: detection only reads names)."""
+    d = parent / name
+    d.mkdir(parents=True, exist_ok=True)
+    for s in shard_names:
+        (d / s).write_bytes(b"x")
+    return d
+
+
+class GgufVariantDetection(unittest.TestCase):
+    """The custom-build label that separates same-family+same-size GGUFs (the Manager's variant naming)."""
+
+    def test_published_files_have_no_variant(self):
+        d = mk_shard_dir(Path(tempfile.mkdtemp()), "Q2_0", SHARD1, SHARD2)
+        det = mgr.detect_gguf_dir(str(d))
+        self.assertIsNone(det["variant"])
+        self.assertEqual(det["tag"], "q2_0")
+        self.assertEqual(det["title"], "Qwen3.8-Flash-Next Q2_0")
+
+    def test_abliterated_build_is_a_variant(self):
+        # the report's real example: E:\Model\Q2_0-Abliterated
+        d = mk_shard_dir(Path(tempfile.mkdtemp()), "Q2_0-Abliterated", ABLITERATED_1, ABLITERATED_2)
+        det = mgr.detect_gguf_dir(str(d))
+        self.assertTrue(det["ok"])
+        self.assertEqual(det["family"], "qwen")
+        self.assertEqual(det["quant"], "Q2_0")
+        self.assertEqual(det["variant"], "abliterated")
+        self.assertEqual(det["title"], "Qwen3.8-Flash-Next Q2_0 Abliterated")
+
+    def test_variant_slug_is_safe_and_deterministic(self):
+        d = mk_shard_dir(Path(tempfile.mkdtemp()), "Q2_0-Abliterated.2!", ABLITERATED_1, ABLITERATED_2)
+        v = mgr.detect_gguf_dir(str(d))["variant"]
+        self.assertRegex(v, r"^[a-z0-9-]+$")          # filesystem-safe: only letters, digits, dashes
+        self.assertEqual(v, mgr.detect_gguf_dir(str(d))["variant"])   # deterministic
+
+    def test_two_variants_are_distinct(self):
+        base = Path(tempfile.mkdtemp())
+        a = mk_shard_dir(base, "Q2_0-Abliterated", ABLITERATED_1, ABLITERATED_2)
+        b = mk_shard_dir(base, "Q2_0-Fine-Tune-A",
+                         "Qwen3.8-Flash-Next-GSQ-RCO-fine-tune-a-Q2_0-00001-of-00002.gguf",
+                         "Qwen3.8-Flash-Next-GSQ-RCO-fine-tune-a-Q2_0-00002-of-00002.gguf")
+        va, vb = mgr.detect_gguf_dir(str(a))["variant"], mgr.detect_gguf_dir(str(b))["variant"]
+        self.assertTrue(va and vb and va != vb)
+
+    def test_family_and_variant_in_choices_from_config(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "strata-q2_0-abliterated.json"
+            p.write_text(json.dumps({"args": ["--max-context", "32768"]}), encoding="utf-8")
+            ch = setup.choices_from_config(p)
+            self.assertEqual((ch["family"], ch["model"]), ("qwen", "Q2_0"))
+            self.assertEqual(ch["variant"], "abliterated")
+            # canonical reads stay model-only, exactly as before
+            q = Path(td) / "strata-q2_0.json"
+            q.write_text(json.dumps({"args": ["--max-context", "32768"]}), encoding="utf-8")
+            self.assertIsNone(setup.choices_from_config(q)["variant"])
+            # the Unsloth size's dash is not mistaken for a variant separator
+            u = Path(td) / "strata-unsloth-ud-q4_k_xl.json"
+            u.write_text(json.dumps({"args": ["--max-context", "8192"]}), encoding="utf-8")
+            ch3 = setup.choices_from_config(u)
+            self.assertEqual((ch3["family"], ch3["model"], ch3["variant"]), ("unsloth", "UD-Q4_K_XL", None))
+            v = Path(td) / "strata-unsloth-ud-q4_k_xl-fast.json"   # a Unsloth build of its own
+            v.write_text(json.dumps({"args": ["--max-context", "8192"]}), encoding="utf-8")
+            ch4 = setup.choices_from_config(v)
+            self.assertEqual((ch4["model"], ch4["variant"]), ("UD-Q4_K_XL", "fast"))
+
+    def test_variant_summary_gets_a_human_title(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            p = root / "strata-q2_0-abliterated.json"
+            p.write_text(json.dumps(sample_cfg(model_name="qwen3.8-flash-next-q2_0"), indent=1),
+                         encoding="utf-8")
+            s = mgr.model_summary(p)
+            self.assertEqual(s["title"], "Qwen3.8-Flash-Next Q2_0 Abliterated")
+            self.assertEqual(s["variant"], "abliterated")
+            self.assertEqual(s["quant"], "Q2_0")
+
+
+class VariantPrepare(unittest.TestCase):
+    """prepare_gguf's identity rules, with setup.py's launch mocked (no model is loaded, nothing runs)."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.root = Path(self.td.name)
+        self.m = mgr.Manager(self.root)
+        self.canonical = mk_shard_dir(self.root, "Q2_0", SHARD1, SHARD2)
+        self.abliterated = mk_shard_dir(self.root, "Q2_0-Abliterated", ABLITERATED_1, ABLITERATED_2)
+        self.cfg_path = self.root / "strata-q2_0.json"
+        self.cfg_path.write_text(json.dumps(sample_cfg(
+            args=["--pack", "p", "--native", str(self.canonical / SHARD1),
+                  "--ple-gguf", str(self.canonical / SHARD2), "--max-context", "32768"]),
+            indent=1), encoding="utf-8")
+        self.original = self.cfg_path.read_bytes()
+        self.fake_tool = {"pid": 4242, "log": str(self.root / "logs" / "p.log"),
+                          "what": "preparing", "started": 1.0}
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def _prepare(self, path, **more):
+        with mock.patch.object(mgr, "run_tool", return_value=dict(self.fake_tool)) as rt:
+            r = self.m.prepare_gguf({"path": str(path), **more})
+            return r, rt
+
+    # 1) the original config exists and the exact same GGUF files are selected -> already installed
+    def test_same_files_are_already_installed(self):
+        r, rt = self._prepare(self.canonical)
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["already"], "strata-q2_0.json")
+        self.assertEqual(r["config"], "strata-q2_0.json")
+        rt.assert_not_called()                        # nothing was launched
+
+    # 2) a DIFFERENT Q2_0 custom GGUF -> its own config; the original file is untouched
+    def test_custom_variant_gets_its_own_config(self):
+        r, rt = self._prepare(self.abliterated, context=65536)
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["config"], "strata-q2_0-abliterated.json")
+        self.assertEqual(r["title"], "Qwen3.8-Flash-Next Q2_0 Abliterated")
+        self.assertIn("--variant", rt.call_args[0][0])
+        self.assertEqual(rt.call_args[0][0][rt.call_args[0][0].index("--variant") + 1], "abliterated")
+        self.assertIn("q2_0-abliterated", r["log"])
+        # the exact reported bug: the original config was NOT treated as "already" and was NOT rewritten
+        self.assertEqual(self.cfg_path.read_bytes(), self.original)
+
+    # 3) two different custom Q2_0 variants -> both coexist under their own names
+    def test_two_custom_variants_coexist(self):
+        tune = mk_shard_dir(self.root, "Q2_0-Fine-Tune-A",
+                            "Qwen3.8-Flash-Next-GSQ-RCO-fine-tune-a-Q2_0-00001-of-00002.gguf",
+                            "Qwen3.8-Flash-Next-GSQ-RCO-fine-tune-a-Q2_0-00002-of-00002.gguf")
+        ra, _ = self._prepare(self.abliterated)
+        rb, _ = self._prepare(tune)
+        self.assertNotEqual(ra["config"], rb["config"])
+        self.assertEqual(ra["config"], "strata-q2_0-abliterated.json")
+        self.assertEqual(rb["config"], "strata-q2_0-fine-tune-a.json")
+        for name in (ra["config"], rb["config"]):
+            self.assertRegex(name, r"^strata-[a-z0-9_-]+\.json$")     # both names stay filesystem-safe
+        self.assertEqual(self.cfg_path.read_bytes(), self.original)   # 4) never overwritten
+
+    # 4) the variant, once installed, is recognized by its GGUF paths (not by family+quant alone)
+    def test_installed_variant_is_recognized_by_its_files(self):
+        cfg = sample_cfg(args=["--pack", "p", "--native", str(self.abliterated / ABLITERATED_1),
+                               "--ple-gguf", str(self.abliterated / ABLITERATED_2), "--max-context", "32768"])
+        (self.root / "strata-q2_0-abliterated.json").write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+        r, rt = self._prepare(self.abliterated)
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["already"], "strata-q2_0-abliterated.json")
+        self.assertEqual(r["title"], "Qwen3.8-Flash-Next Q2_0 Abliterated")
+        rt.assert_not_called()
+
+    # 5) the generated names are deterministic, filesystem-safe and collision-resistant
+    def test_names_are_deterministic_safe_and_collision_aware(self):
+        name1, _ = self._prepare(self.abliterated)
+        name2, _ = self._prepare(self.abliterated)
+        self.assertEqual(name1["config"], name2["config"])
+        self.assertRegex(name1["config"], r"^strata-[a-z0-9_-]+\.json$")
+        # a second build whose readable name is already another INSTALLED build's: setup.py must never
+        # overwrite - the hash suffix lives in the --variant itself, so the config it writes is unique
+        other = mk_shard_dir(self.root, "Q2_0-Copy2", ABLITERATED_1, ABLITERATED_2)   # same files, own folder
+        (other / ABLITERATED_1).write_bytes(b"other-tensor")
+        (other / ABLITERATED_2).write_bytes(b"other-tensor")
+        first_cfg = sample_cfg(args=["--pack", "p", "--native", str(self.abliterated / ABLITERATED_1),
+                                     "--ple-gguf", str(self.abliterated / ABLITERATED_2), "--max-context", "32768"])
+        (self.root / name1["config"]).write_text(json.dumps(first_cfg, indent=1), encoding="utf-8")
+        r3, rt3 = self._prepare(other)
+        self.assertNotEqual(r3["config"], name1["config"])           # never reuses the other build's config
+        cmd3 = rt3.call_args[0][0]
+        v = cmd3[cmd3.index("--variant") + 1]
+        self.assertEqual(r3["config"], f"strata-q2_0-{v}.json")      # the name setup.py will write, exactly
+        self.assertNotEqual(v, "abliterated")
+        self.assertEqual(self.cfg_path.read_bytes(), self.original)
+
+    # the canonical-looking files with the canonical slot taken (by OTHER files) get a folder/hash identity
+    def test_canonical_lookalike_uses_folder_or_hash(self):
+        clone = mk_shard_dir(self.root, "Q2_0-copy", SHARD1, SHARD2)
+        r, kind = self._prepare(clone)
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["config"], "strata-q2_0-copy.json")   # the folder name says it is a different copy
+        r2, _ = self._prepare(clone)
+        self.assertEqual(r["config"], r2["config"])              # deterministic
+        self.assertEqual(self.cfg_path.read_bytes(), self.original)
+
+    # no canonical config yet -> the custom build still gets its own variant config (never the canonical name)
+    def test_first_install_custom_build_keeps_its_variant_name(self):
+        self.cfg_path.unlink()
+        r, rt = self._prepare(self.abliterated)
+        self.assertEqual(r["config"], "strata-q2_0-abliterated.json")
+        rt.assert_called_once()
+        cmd = rt.call_args[0][0]
+        self.assertTrue(any(a.endswith("setup.py") for a in cmd))
+        self.assertIn("--gguf-dir", cmd)
+        self.assertIn("--no-start", cmd)
+        self.assertIn("--yes", cmd)
+
+    # a fresh canonical install behaves exactly as before: the canonical name, no --variant
+    def test_fresh_canonical_install_is_unchanged(self):
+        self.cfg_path.unlink()
+        r, rt = self._prepare(self.canonical)
+        self.assertEqual(r["config"], "strata-q2_0.json")
+        self.assertNotIn("--variant", rt.call_args[0][0])
+
+
+class PrepareStatus(unittest.TestCase):
+    """The status data behind the UI's preparing/failed/success states (no model is loaded)."""
+
+    def _state(self, root: Path, tool: dict):
+        st = {"server": {}, "tool": tool}
+        state_path = root / "logs" / "manager.json"
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(json.dumps(st), encoding="utf-8")
+        return mgr.Manager(root).status_payload()
+
+    def test_running_tool_is_alive_without_outcome(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "logs").mkdir()
+            with mock.patch.object(mgr.launcher, "pid_alive", return_value=True):
+                p = self._state(root, {"pid": 1, "log": str(root / "logs" / "p.log"),
+                                       "config": "strata-q2_0-abliterated.json",
+                                       "title": "Qwen3.8-Flash-Next Q2_0 Abliterated"})
+            self.assertTrue(p["tool"]["alive"])
+            self.assertNotIn("failed", p["tool"])
+
+    # 7) a failed prepare exposes the error (and the log path), it never looks like a silent success
+    def test_failed_setup_is_reported(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            log = root / "logs" / "p.log"
+            log.parent.mkdir(parents=True, exist_ok=True)
+            log.write_text("  [X]  the model has no per_layer_token_embd tensor\n\n"
+                           "Setup stopped. Fix the item above and run it again.\n", encoding="utf-8")
+            with mock.patch.object(mgr.launcher, "pid_alive", return_value=False):
+                p = self._state(root, {"pid": 99, "log": str(log), "config": "strata-q2_0-bad.json",
+                                       "title": "Qwen3.8-Flash-Next Q2_0 Bad"})
+            self.assertFalse(p["tool"]["alive"])
+            self.assertTrue(p["tool"]["failed"])
+            self.assertFalse(p["tool"]["ready"])   # the config it promised was never written
+            self.assertEqual(p["tool"]["log"], str(log))   # the UI shows the log path
+
+    def test_successful_setup_is_reported(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            log = root / "logs" / "p.log"
+            log.parent.mkdir(parents=True, exist_ok=True)
+            log.write_text("All set.\n", encoding="utf-8")
+            (root / "strata-q2_0-abliterated.json").write_text("{}")   # setup actually wrote it
+            with mock.patch.object(mgr.launcher, "pid_alive", return_value=False):
+                p = self._state(root, {"pid": 99, "log": str(log), "config": "strata-q2_0-abliterated.json",
+                                       "title": "Qwen3.8-Flash-Next Q2_0 Abliterated"})
+            self.assertFalse(p["tool"]["alive"])
+            self.assertFalse(p["tool"]["failed"])
+            self.assertTrue(p["tool"]["ready"])
+
+    def test_prepare_http_contract_refreshes_and_selects(self):
+        """/api/prepare-gguf returns the config+title+log the UI selects on success; /api/models then lists
+        both models (the original and the variant) - the data contract behind "refresh + select" and the
+        success toast.  setup.py's launch is mocked: no model is loaded."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = sample_cfg()
+            (root / "strata-q2_0.json").write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+            srv = mgr.make_server(root, 0)
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            base = f"http://127.0.0.1:{srv.server_address[1]}"
+            abliterated = mk_shard_dir(root, "Q2_0-Abliterated", ABLITERATED_1, ABLITERATED_2)
+            with mock.patch.object(mgr, "run_tool",
+                                   return_value={"pid": 7, "log": str(root / "logs" / "p.log"),
+                                                 "what": "w", "started": 0.0}) as rt:
+                with urllib.request.urlopen(urllib.request.Request(
+                        base + "/api/prepare-gguf",
+                        data=json.dumps({"path": str(abliterated)}).encode(),
+                        headers={"Content-Type": "application/json"}), timeout=10) as r:
+                    out = json.loads(r.read())
+            self.assertTrue(out["ok"])
+            self.assertEqual(out["config"], "strata-q2_0-abliterated.json")
+            self.assertEqual(out["title"], "Qwen3.8-Flash-Next Q2_0 Abliterated")
+            self.assertIn("manager-prepare-q2_0-abliterated.log", out["log"])
+            rt.assert_called_once()
+            # the variant's config lands (here: written by the test, as setup.py would) and BOTH are listed
+            variant_cfg = dict(sample_cfg(
+                args=["--pack", "p", "--native", str(abliterated / ABLITERATED_1),
+                      "--ple-gguf", str(abliterated / ABLITERATED_2), "--max-context", "32768"]))
+            (root / out["config"]).write_text(json.dumps(variant_cfg, indent=1), encoding="utf-8")
+            with urllib.request.urlopen(base + "/api/models", timeout=10) as r:
+                models = json.loads(r.read())["data"]["models"]
+            names = {m["config"] for m in models}
+            self.assertEqual(names, {"strata-q2_0.json", "strata-q2_0-abliterated.json"})
+            by_name = {m["config"]: m for m in models}
+            self.assertEqual(by_name["strata-q2_0-abliterated.json"]["title"],
+                             "Qwen3.8-Flash-Next Q2_0 Abliterated")
+            srv.shutdown(); srv.server_close()
+
 
 
 class Discovery(unittest.TestCase):
@@ -827,6 +1125,117 @@ class LauncherBat(unittest.TestCase):
         bat = self._bat()
         self.assertIn("exit /b 0", bat)
         self.assertIn("exit /b 1", bat)
+
+
+class SetupVariant(unittest.TestCase):
+    """setup.py's --variant: the EXISTING pipeline, one extra flag; the config, pack and run script get the
+    variant's own names, and the canonical strata-q2_0.json is neither written nor touched.  setup.main is
+    run with every outside effect mocked (no GPU, no downloads, no engine start)."""
+
+    class FakeGGUF:
+        """The PLE table lives in shard 2 (the same shape the unsloth harness fakes)."""
+        def __init__(self, path):
+            self.tensors = [types.SimpleNamespace(name="per_layer_token_embd.weight")]
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.t = Path(self.tmp.name)
+        (self.t / "data" / "mtp" / "rt").mkdir(parents=True)
+        (self.t / "data" / "mtp" / "rt" / "experts.bin").write_bytes(b"")
+        self.downloads, self.runs = [], []
+        self.shards = mk_shard_dir(self.t, "gguf-abliterated", ABLITERATED_1, ABLITERATED_2)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def main(self, argv, existing_canonical=None):
+        eng = self.t / "engine"
+        eng.mkdir(exist_ok=True)
+        (eng / "BUILD.json").write_text(json.dumps({"version": "0.1.36", "source": "local"}))
+        found = [{"index": 0, "name": "NVIDIA GeForce RTX 5070", "vram_gb": 11.9, "arch": "120",
+                  "driver": "580.97"}]
+
+        def fake_download(url, dst, what=None):
+            self.downloads.append(url)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(b"")
+            setup.mark(dst)
+
+        def fake_run(cmd, *a, **k):
+            self.runs.append([str(x) for x in cmd])
+
+        root_cfg = self.t / "strata-q2_0.json"
+        if existing_canonical:
+            root_cfg.write_text(json.dumps(sample_cfg(), indent=1), encoding="utf-8")
+            canon_before = root_cfg.read_bytes()
+        written_scripts = []
+        argv = ["setup.py", "--family", "qwen", "--model", "Q2_0", "--gguf-dir", str(self.shards),
+                "--context", "32768", "--no-start", "--yes", *argv]
+        patches = [
+            mock.patch.object(setup, "ROOT", self.t),
+            mock.patch.object(setup, "GPU_PICK", None),
+            mock.patch.object(setup, "data_folder", lambda d: (self.t / "data", [])),
+            mock.patch.object(setup, "installed_configs", lambda: []),
+            mock.patch.object(setup, "gpus", lambda: found),
+            mock.patch.object(setup, "amd_gpus", lambda *a: []),
+            mock.patch.object(setup, "ram_gb", lambda: 63.7),
+            mock.patch.object(setup, "cpu_info", lambda: ("Test CPU", True, True)),
+            mock.patch.object(setup, "page_file_gb", lambda: 16.0),
+            mock.patch.object(setup, "free_gb", lambda p: 500.0),
+            mock.patch.object(setup, "pip_install", lambda *a, **k: None),
+            mock.patch.object(setup, "get_llama_cpp", lambda: self.t / "llama.cpp"),
+            mock.patch.object(setup, "get_prebuilt", lambda *a, **k: eng),
+            mock.patch.object(setup, "check_shards", lambda shards: None),
+            mock.patch.object(setup, "whole_shard", lambda s: False),   # the stub shards are not the model itself
+            mock.patch.object(setup, "run", fake_run),
+            mock.patch.object(setup, "refresh_draft_vocab", lambda *a, **k: None),
+            mock.patch.object(setup, "write_run_script",
+                              lambda tag, cfg, port: written_scripts.append(tag)
+                              or self.t / f"run-{tag.lower()}.bat"),
+            mock.patch.object(setup, "saved_calibration", lambda cfg: None),
+            mock.patch.object(setup, "start", mock.Mock(side_effect=AssertionError("started"))),
+            mock.patch.dict(sys.modules, {"gguf_reader": types.SimpleNamespace(GGUFFile=self.FakeGGUF)}),
+            mock.patch.object(sys, "argv", argv),
+            mock.patch("builtins.input", mock.Mock(side_effect=AssertionError("asked"))),
+        ]
+        with contextlib.ExitStack() as st:
+            for p in patches:
+                st.enter_context(p)
+            try:
+                code = setup.main()
+            except SystemExit as e:                    # fail() calls sys.exit(1)
+                code = e.code
+        return code, root_cfg, (json.loads(root_cfg.read_text(encoding="utf-8-sig")) if root_cfg.exists() else None), \
+            canon_before if existing_canonical else None, written_scripts
+
+    def test_variant_config_pack_and_script_are_unique(self):
+        code, _, _, _, written_scripts = self.main(["--variant", "abliterated"])
+        self.assertEqual(code, 0)
+        vcfg = self.t / "strata-q2_0-abliterated.json"
+        self.assertTrue(vcfg.is_file(), "the variant config was written")
+        self.assertFalse((self.t / "strata-q2_0.json").exists(), "no canonical config is fabricated")
+        cfg = json.loads(vcfg.read_text(encoding="utf-8-sig"))
+        args = cfg["args"]
+        # its own pack: the fused experts are rebuilt from THIS build's shards, never the original's
+        self.assertTrue(args[args.index("--pack") + 1].endswith(os.path.join("packs", "q2_0-abliterated")))
+        packs = [r for r in self.runs if r[1].endswith("strata_pack.py")]
+        self.assertEqual(len(packs), 1, self.runs)
+        self.assertTrue(packs[0][packs[0].index("--out") + 1].endswith(os.path.join("packs", "q2_0-abliterated")))
+        self.assertTrue(args[args.index("--native") + 1].endswith(ABLITERATED_1))
+        self.assertEqual(cfg["log"], str(self.t / "strata-q2_0-abliterated.log"))   # its own log
+        self.assertEqual(written_scripts, ["Q2_0-abliterated"])   # its own start script (lowercased on disk)
+
+    def test_variant_never_overwrites_an_existing_canonical_config(self):
+        code, root_cfg, _, canon_before, _ = self.main(["--variant", "abliterated"], existing_canonical=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(root_cfg.read_bytes(), canon_before)   # bytes-identical, untouched
+        self.assertTrue((self.t / "strata-q2_0-abliterated.json").is_file())
+
+    def test_bad_variant_is_refused(self):
+        code, _, _, _, _ = self.main(["--variant", "not allowed space"])
+        self.assertEqual(code, 1)
+        self.assertFalse((self.t / "strata-q2_0.json").exists())
+        self.assertFalse((self.t / "strata-q2_0-not").exists())
 
 
 if __name__ == "__main__":

@@ -94,6 +94,14 @@ select.st-input:disabled { opacity: .55; cursor: not-allowed; }
            border-top-color: var(--st-warn); border-radius: 50%; animation: spin .8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+/* the custom-GGUF preparation card: the running setup.py state + its live log (or the failure's tail) */
+.mg-prepare { margin-top: var(--st-s-3); border: 1px solid var(--st-line); border-radius: var(--st-r-md);
+              padding: var(--st-s-3); background: var(--st-surface-2); }
+.mg-prepare-head { display: flex; align-items: center; gap: 10px; font-size: var(--st-fs-sm);
+                   font-weight: var(--st-fw-medium); color: var(--st-ink); }
+.mg-prepare .mg-log { margin: var(--st-s-2) 0 0; max-height: 180px; overflow: auto; padding: var(--st-s-2) var(--st-s-3);
+                      font-family: var(--st-font-mono); }
+
 /* ---------------------------------------------------------------- models */
 .badge { display: inline-flex; align-items: center; padding: 1px 9px; border-radius: var(--st-r-pill);
          font-size: var(--st-fs-xs); font-weight: var(--st-fw-bold); }
