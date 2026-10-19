@@ -261,6 +261,15 @@ things you use all the time stay on the counter and the rest waits in the pantry
 Want the full picture? The [details](docs/DETAILS.md#how-it-works) explain every part and its numbers, and the
 [paper](docs/paper/Strata-Paper.pdf) tells the whole story, with the measurements behind it.
 
+## Measuring speed
+
+The numbers above are worth verifying on your own machine. `hermes-token-speed`
+(https://github.com/Ayshinko/hermes-token-speed) puts a live tokens-per-second
+chip in the Hermes Agent desktop status bar — 1-second sliding window, tool
+time excluded, spinner frames never counted — so you can watch the real decode
+speed of whatever quantization you are running. For the Pi coding agent, the
+same measurement lives in `pi-token-speed` and `pi-dsh-tps`.
+
 ## Credits
 
 - Model: [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team; compressed versions by
